@@ -24,28 +24,49 @@ whether that signal survives contact with a properly tuned gradient-boosting bas
 
 This project answers that question end to end on public data, then prices the answer.
 
-### Hypothesis (H1)
+### Hypothesis (H1) — magnitude
 
 > Adding fine-tuned product-text embeddings to a tabular purchase-propensity model
 > improves ranking quality over a tuned LightGBM model trained on tabular features alone,
 > on an identical temporal test split.
 
-### Pre-registered success criterion
+### Hypothesis (H2) — direction
 
-Fixed **before any model is run**, so the result cannot be rationalized after the fact.
+> The lift is **concentrated in cold-start articles**, where popularity features are near
+> zero and the product description is fully available from day one.
 
-H1 is **supported** only if both hold on the held-out test split:
+H2 is the substantively interesting claim, and registering it in advance is what separates a
+prediction that survived from a story assembled after seeing the slice table.
+
+### Pre-registered success criteria
+
+Fixed **before any model is run**, so results cannot be rationalized after the fact. Both
+are judged on the held-out test split.
+
+**H1 is supported** only if both hold:
 
 1. **ΔAUC ≥ 0.005** (combined arm minus tabular baseline), and
 2. the **95% bootstrap CI on ΔAUC excludes zero** (1000 resamples, resampled over
    customers — see §8).
 
-Anything less is a **null result**.
+**H2 is supported** only if both hold:
+
+1. **ΔAUC(cold-start) > ΔAUC(all rows)**, and
+2. the **95% bootstrap CI on that difference of deltas excludes zero**, computed on shared
+   customer resamples (`trd.md` §10.2).
+
+Anything less, on either, is a **null result** for that hypothesis.
+
+**The two are independent.** H1 can fail while H2 holds — text contributing nothing on
+aggregate but real lift where popularity is blank. That combination is a more useful finding
+than a diffuse aggregate win, because it names a deployment condition rather than a vague
+improvement.
 
 ### Commitment to publishing a null result
 
-If the encoder does not clear the bar, `reports/results.md` reports that as the headline
-finding, with the same rigor and prominence a positive result would receive. "Semantic
+If the encoder does not clear the bar on **either** hypothesis, `reports/results.md` reports
+that as the headline finding, with the same rigor and prominence a positive would receive.
+"Semantic
 content added no lift over well-built tabular features, at this cost" is a legitimate and
 useful conclusion. No arm is re-tuned, no split is re-cut, and no metric is swapped in
 order to manufacture a positive. The test split is touched **once**, at the end.
@@ -432,7 +453,7 @@ that matters:
 | Slice | Definition | Why |
 |---|---|---|
 | **All rows** | — | The headline, and the population the §1 criterion is judged on |
-| **Cold-start articles** | `art_prior_purchases < N` | Popularity features are absent or near-zero here, while text is fully available from day one. **If text wins anywhere, it wins here** — and this is the strongest business argument the project can make |
+| **Cold-start articles** | `art_prior_purchases < 10` | Popularity features are absent or near-zero here, while text is fully available from day one. **If text wins anywhere, it wins here** — and this is the strongest business argument the project can make |
 | **Low-history customers** | few prior purchases | The symmetric weak case: thin taste vectors, so personalized text features degrade. Bounds the claim |
 
 ### Business proxy

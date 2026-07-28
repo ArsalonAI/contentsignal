@@ -1,12 +1,23 @@
 # ContentSignal
 
-**Does a language model reading product descriptions know anything a well-built tabular
-model doesn't?**
+**Problem.** Score (customer, article) pairs from implicit feedback — 31.8M H&M purchase
+events, 105k items, positive-only, ranked per customer under a strict temporal split. Base
+rate is on the order of 10⁻⁵ against the full catalog before negative sampling.
 
-Most e-commerce ranking systems run on tabular signals — customer history, item popularity,
-price, recency, taxonomy. Product *content* gets reduced to categorical IDs or dropped
-entirely. This project tests whether that's leaving signal on the table, on 31.8M real
-transactions, and prices the answer in dollars per million predictions.
+**The tension.** Every item carries two representations whose overlap is unknown:
+
+| | |
+|---|---|
+| **Tabular** | windowed popularity (1/4/12w), price percentile, shelf age, an 11-column taxonomy — all consumed natively by LightGBM |
+| **Text** | free-text `detail_desc` — the only field in the catalog with no categorical twin |
+
+Gradient-boosted trees dominate this problem class. A fine-tuned encoder earns its place
+only if it reaches signal the trees cannot — and most "text" fields in this catalog *are*
+the taxonomy columns rendered as strings, so the naive setup measures redundancy and reports
+it as lift.
+
+**This repo is the experiment that separates the two, and the tradeoff reasoning behind
+every decision that determines whether the answer is trustworthy.**
 
 > ### Status: specification complete, implementation not started
 >
@@ -22,55 +33,73 @@ transactions, and prices the answer in dollars per million predictions.
 
 ---
 
-## The hypothesis, pre-registered
+## Pre-registered hypotheses
 
-> Adding fine-tuned product-text embeddings to a tabular purchase-propensity model improves
-> ranking quality over a tuned LightGBM baseline, on an identical temporal test split.
+Both fixed before any model runs, so neither result can be rationalized afterward.
 
-**Success is defined before any model runs**, so the result can't be rationalized afterward:
+**H1 — magnitude.** Fine-tuned text embeddings improve ranking quality over a tuned
+LightGBM baseline on an identical temporal test split.
 
 ```
 ΔAUC ≥ 0.005   AND   95% bootstrap CI on ΔAUC excludes zero
 ```
 
-Anything less is a null result — and **a null result gets published as the headline
+**H2 — direction.** The lift concentrates in cold-start articles, where popularity features
+are near zero and the description is complete from day one.
+
+```
+ΔAUC(cold-start) > ΔAUC(all)   AND   95% CI on the difference of deltas excludes zero
+```
+
+H2 is the claim worth making. "Text helps" is diffuse; "text helps precisely where
+behavioral signal is missing" names a deployment condition. **The two are independent** —
+H1 can fail while H2 holds, and that combination is the more useful outcome.
+
+Anything less, on either, is a null result — and **a null gets published as the headline
 finding**, with the same prominence a positive would get. No re-tuning, no re-cutting
 splits, no swapping metrics until something clears the bar. The test split is read exactly
 once, at the end.
 
-"Semantic content added no lift over well-built tabular features, at this cost" is a useful
-answer. A repo that can only produce good news isn't measuring anything.
+A repo that can only produce good news isn't measuring anything.
 
 ---
 
-## Three ways this experiment gets rigged — and how each is closed
+## Design decisions
 
-This is the interesting part. Each of these is a way to produce a headline number that
-looks great and means nothing.
+Every row is a place where two defensible options existed. Reasons are mechanisms or
+numbers, never preferences. Full derivations in [`trd.md`](./trd.md).
 
-### 1. Give the encoder information you withheld from the baseline
+| Decision | Considered | Chosen | Reason |
+|---|---|---|---|
+| **Text → GBDT dimensionality** | raw 384 / SVD-32 / SVD-64 | **SVD-32** | 384 dense low-variance dims degrade axis-aligned splits and cost 1.6 GB vs 400 MB binned at 5M rows. 64 and 384 run as sensitivity, not as the grid |
+| **Fine-tune objective** | pointwise item-rate / contrastive co-purchase | **contrastive** | An item-rate target ≈ article popularity, which the baseline already holds *measured exactly*. The encoder would learn a lossy copy of an existing feature, and the resulting null would be an artifact of the objective rather than a fact about text |
+| **Personalization** | item-side embeddings only / taste-vector cosine / learned two-tower | **taste-vector cosine** | Item-side dims are constant per customer and cannot reorder a per-customer ranking. A two-tower would likely win outright, but confounds the encoder's marginal contribution — which is the quantity being measured |
+| **Negative sampling ratio** | 1:1 / 1:10 / 1:50 | **1:10, fixed across arms** | Trades compute against calibration. AUC is sampling-invariant; log-loss is not, so log-loss is prior-corrected and reported both ways |
+| **Baseline feature set** | text fields to the encoder only / all 11 categoricals to the baseline | **all 11 to the baseline** | Otherwise the encoder is credited with information the baseline was denied. This is the difference between measuring lift and manufacturing it |
+| **Hyperparameter budget** | tune each arm / tune baseline once, then freeze | **freeze** | Per-arm tuning confounds "better features" with "more tuning budget" |
+| **Bootstrap resampling unit** | rows / customers | **customers** | Rows within a customer share history features and basket composition. Row-level CIs are narrow enough for noise to clear the ΔAUC ≥ 0.005 bar |
+| **Data engine** | pandas / Polars + DuckDB | **Polars + DuckDB** | 31.8M rows do not fit in pandas at 8 GB; aggregation runs out-of-core |
+| **`max_bin`** | 255 (default) / 63 | **63** | 400 MB binned vs 1.6 GB raw at 5M × 80. A feasibility requirement, not a tuning choice |
+| **Serving path** | online forward pass / offline embedding cache | **offline cache** | 105k × 384 × 4 B ≈ 162 MB. The catalog fits in memory, so the transformer never runs at request time except for new items |
 
-Nearly every "text" field in the H&M catalog has a **1:1 categorical twin**.
-`product_type_name` is both a string the encoder can read and a categorical column
-LightGBM can split on. Feed the encoder all of it, hand the baseline a subset, and you've
-manufactured lift out of an unfair comparison.
+---
 
-**Closed by:** the baseline receives all eleven categorical columns as native LightGBM
-categoricals, and the text arm splits into two variants — **Text-A** (full concat,
-optimistic bound) and **Text-B** (`detail_desc` only, the sole field with no categorical
-twin). Text-B is the honest measure. Reporting both quantifies how much apparent "text
-lift" is really taxonomy the trees already had.
+## Two ways this experiment gets rigged — and how each is closed
 
-### 2. Build a text feature that structurally cannot help
+The rows above are judgment calls. These two are validity failures: setups that produce a
+headline number which looks great and means nothing.
 
-The obvious design joins article embeddings into the feature table as 32 columns. But those
+### 1. Build a text feature that structurally cannot help
+
+The obvious design joins article embeddings into the feature table as 32 columns. Those
 columns hold **the same value for every customer** — and a feature constant across customers
 *cannot reorder items differently per customer*. For `precision@k` and `MAP@12`, which are
 per-customer rankings, item-side text contributes almost nothing beyond what popularity
 already contributes.
 
-That design produces a null result regardless of whether product semantics carry signal.
-The finding would be an artifact of the architecture, not a fact about text.
+That design yields a null result regardless of whether product semantics carry signal. The
+finding would be a fact about the architecture, not about text — and it would be reported as
+the latter.
 
 **Closed by** putting the customer on both sides:
 
@@ -81,9 +110,11 @@ The finding would be an artifact of the architecture, not a fact about text.
   person sit close together*
 
 The encoder never reads a customer column. Customer information enters through *which pairs
-are positives*.
+are positives*. Pair sampling is capped at 5 per customer and 50 per article — uncapped, it
+is dominated by heavy buyers and bestsellers, which pushes the encoder straight back toward
+the popularity proxy the contrastive objective exists to avoid.
 
-### 3. Let the future leak backward
+### 2. Let the future leak backward
 
 Item popularity computed over the full dataset is one line of code, works extremely well,
 and contains the future.
@@ -113,15 +144,19 @@ assert_frame_equal(
 **Splits** — ten contiguous 14-day windows: 8 train, 1 validation, 1 test. Strictly
 chronological, never shuffled. Features for a window read only data strictly before it.
 
-**Negatives** — implicit feedback has no true negatives, so they're sampled at a fixed 1:10,
-popularity-weighted (`pop^0.75`; uniform negatives are trivially separable and inflate AUC).
-The sampled row set is written once and **reused byte-identically by every arm** — otherwise
+**Negatives** — implicit feedback has no true negatives. Sampled popularity-weighted at
+`pop^0.75`, since uniform negatives are trivially separable and inflate AUC. The sampled row
+set is written once, digested, and **reused byte-identically by every arm** — without that,
 a ΔAUC of 0.005 is indistinguishable from a different random draw.
 
-**Calibration** — downsampling negatives shifts the base rate, so log-loss and the revenue
-proxy are prior-corrected back to the true rate. AUC needs no correction (it's rank-based
-and sampling-invariant); log-loss does. That asymmetry is stated explicitly so it doesn't
-read as an oversight.
+**Text variants** — run separately, because they measure different things:
+
+| | Content | Reads as |
+|---|---|---|
+| **Text-A** | full concat: name + type + group + colour + department + `detail_desc` | Optimistic bound. Overlaps the taxonomy the baseline already has, so part of any lift is re-encoded categoricals |
+| **Text-B** | `detail_desc` only | The honest measure. The one field with no categorical twin, so lift here is genuinely novel information |
+
+Reporting both quantifies how much apparent "text lift" is taxonomy in disguise.
 
 **Arms** — two orthogonal axes, so each delta isolates one thing:
 
@@ -140,13 +175,6 @@ read as an oversight.
 | **headline** | total lift from product content |
 | personalized − item-side | how much requires the customer-side features |
 | fine-tuned − frozen | whether fine-tuning beat an off-the-shelf encoder |
-
-Hyperparameters are tuned on the baseline **once, then frozen** across every arm — otherwise
-"better features" is confounded with "more tuning budget."
-
-**Uncertainty** — 1000-resample bootstrap that **resamples customers, not rows**. Rows within
-a customer share history features and basket composition; row-level resampling gives
-confidence intervals narrow enough for noise to clear the significance bar.
 
 **Slices** — every metric on three populations: all rows, **cold-start articles**, and
 low-history customers. Cold start is where text should win if it wins anywhere: a new

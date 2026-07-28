@@ -686,6 +686,19 @@ def bootstrap_delta(
     y: np.ndarray, p_a: np.ndarray, p_b: np.ndarray,
     customer: np.ndarray, *, metric: Callable, n: int = 1000, seed: int,
 ) -> BootstrapResult: ...
+
+def bootstrap_delta_of_deltas(
+    y: np.ndarray, p_a: np.ndarray, p_b: np.ndarray,
+    customer: np.ndarray, slice_mask: np.ndarray,
+    *, metric: Callable, n: int = 1000, seed: int,
+) -> BootstrapResult:
+    """The H2 statistic: delta on the slice minus delta on all rows (PRD §1).
+
+    Both deltas are computed from the SAME customer resample on each iteration.
+    Customers appear in both populations — a customer can have cold-start and
+    established candidates in one basket — so two independent bootstraps would
+    treat correlated quantities as independent and understate the CI.
+    """
 ```
 
 **Resamples customer IDs, then gathers all rows belonging to the drawn customers.** Rows
@@ -940,7 +953,7 @@ correction is strictly monotone, so AUC is unchanged.
 | **M3** | Arms 1–3 trained | Digest check passes | First `all`-slice AUC/log-loss table |
 | **M4** | Frozen embeddings, taste vectors, arms 4a/4b | `test_leakage.py` still green | Δ(4b − 4a): does personalization help at all |
 | **M5** | Contrastive checkpoints | Collapse check passes | `diag/spearman_pop`, NN dumps |
-| **M6** | Arms 7a/7b + sensitivity | Full grid complete | **All three deltas with 95% CIs, all three slices** |
+| **M6** | Arms 7a/7b + sensitivity | Full grid complete | **All three deltas with 95% CIs, all three slices, plus the H2 delta-of-deltas** |
 | **M7** | Calibration + business proxy | `test_calibration.py` green | Corrected log-loss, Brier, AOV lift ratio |
 | **M8** | Benchmark results | — | Latency table, $/1M, measured `nbytes` |
 | **M9** | `reports/results.md`, `README.md` | `make report` reproduces every number | **The §1 verdict: supported or null** |

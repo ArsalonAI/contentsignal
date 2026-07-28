@@ -120,9 +120,11 @@ confounds "better features" with "more tuning budget" (`trd.md` §9.4).
 **`max_bin=63` is a memory requirement, not a tuning choice.** It takes the 5M × 80 matrix
 from 1.6 GB raw to 400 MB binned, which is what makes LightGBM fit in 8 GB (`trd.md` §14).
 
-**The test split is read once, at M9.** M3–M8 report validation numbers. The pre-registered
-success criterion (ΔAUC ≥ 0.005 with a customer-level bootstrap CI excluding zero) is
-applied to that single evaluation (`prd.md` §1).
+**The test split is read once, at M9.** M3–M8 report validation numbers. **Both**
+pre-registered criteria are applied to that single evaluation — H1 (ΔAUC ≥ 0.005 with a
+customer-level bootstrap CI excluding zero) and H2 (ΔAUC on cold-start exceeds ΔAUC on all
+rows, CI on the difference of deltas excluding zero). Evaluating one and quietly dropping
+the other defeats the point of registering them (`prd.md` §1).
 
 **Bootstrap resamples customers, not rows.** Rows within a customer share history features
 and basket composition; row-level resampling gives CIs narrow enough for noise to clear the
