@@ -27,6 +27,7 @@ Every PRD section maps to at least one section here. Nothing is allowed to drop 
 | §5 | Negative sampling, prior correction | §7, §10.3 |
 | §6 | Feature groups incl. customer-side text | §6 |
 | §7 | Arm grid, contrastive fine-tune | §8, §9 |
+| §7 | Two-tower architecture, sampled softmax, log-Q | §9b, §15 (`test_twotower.py`) |
 | §8 | Metrics, bootstrap, slices, business proxy | §10 |
 | §9 | Inference cost profiling | §12 (`bench`), §4 (mmap-able artifacts) |
 | §10 | Repo layout | §5, §13 |
@@ -234,8 +235,12 @@ The materialized labelled row sets — **written once, then immutable**.
 | `window` | `categorical` |
 
 A `rows_manifest.json` alongside records the sampler seed, ratio, per-window counts, and a
-SHA-256 of each file. Every arm asserts this digest before training. This is what makes
-"every arm reads byte-identical rows" (PRD §5) enforceable rather than aspirational.
+SHA-256 of each file. **Arms 1–8 assert this digest before training.** This is what makes
+"identical rows" (PRD §5) enforceable rather than aspirational.
+
+> **Arms 9/10 are the bounded exception.** They train with in-batch sampled softmax over
+> positives only, so they never read these files for training — but they **assert the same
+> digest before evaluation**, since they are scored on the identical test rows (§9b.4).
 
 ### 4.6 `artifacts/features/{group}/{window}.parquet`
 
@@ -626,6 +631,8 @@ Reported whatever they show; suppressing them would defeat the point.
 | Sensitivity: raw taste dims on 7b | B | 3 | 3 |
 | | | | **48** |
 
+Plus **13** two-tower runs (§9b.6) → **61 total**.
+
 SVD dim is fixed at **32** for the main grid; 64 and raw-384 appear only in the sensitivity
 rows. This is the single largest lever on total runtime and is deliberately bounded.
 
@@ -650,6 +657,123 @@ early_stopping_round: 100    # on val AUC
 Hyperparameters are tuned **on val, for arm 3 only**, then frozen and reused by every
 LightGBM arm. Tuning each arm separately would confound "better features" with "more tuning
 budget" — the delta must be attributable to features alone.
+
+---
+
+## 9b. Two-tower neural ranker (arms 9, 10)
+
+### 9b.1 Architecture
+
+```python
+# models/twotower.py
+
+class ItemTower(nn.Module):
+    """text → MiniLM → proj ⊕ categorical embeddings ⊕ numerics → MLP → 128, L2-normed."""
+    def __init__(self, encoder: SentenceTransformer, *, freeze_encoder: bool,
+                 cat_cardinalities: dict[str, int], n_numeric: int, out_dim: int = 128): ...
+    def forward(self, text_ids, text_mask, cats, nums) -> Tensor: ...   # [B, 128]
+
+class CustomerTower(nn.Module):
+    """history (attention-pooled item IDs) ⊕ categorical ⊕ numerics → MLP → 128, L2-normed."""
+    def __init__(self, n_items: int, id_dim: int = 64, hist_len: int = 20,
+                 cat_cardinalities: dict[str, int] = ..., n_numeric: int = ...,
+                 out_dim: int = 128): ...
+    def forward(self, hist_ids, hist_mask, cats, nums) -> Tensor: ...   # [B, 128]
+
+class TwoTower(nn.Module):
+    def score(self, cust_vec, item_vec) -> Tensor:     # temperature-scaled dot product
+        return (cust_vec * item_vec).sum(-1) / self.temperature
+```
+
+| Component | Spec |
+|---|---|
+| Item-ID embedding table | 105k × 64 (~27 MB) |
+| History length | last 20 purchases, right-padded, masked |
+| History pooling | **self-attentive with a learned query vector** — `softmax(qᵀ tanh(W·h)) · h` |
+| Tower MLPs | [512, 256] → 128, GELU, dropout 0.1, L2-normalized output |
+| Categorical embeddings | 8–16 d per field |
+| Temperature | learned scalar, init 0.05 |
+
+> **Self-attentive, never candidate-aware.** A candidate-conditioned attention would score
+> better, but the customer vector would then depend on the item, and neither tower could be
+> precomputed. That breaks retrieval and voids the §12 serving-cost analysis. Enforced by the
+> signature: `CustomerTower.forward` takes **no item argument**. Asserted in
+> `tests/test_twotower.py::test_customer_tower_is_item_independent`.
+
+### 9b.2 Training
+
+```python
+def sampled_softmax_loss(
+    cust: Tensor, item: Tensor, item_ids: Tensor,
+    *, log_q: Tensor, temperature: Tensor,
+) -> Tensor:
+    """In-batch sampled softmax with log-Q correction (Yi et al., RecSys 2019).
+
+    logits[i][j] = cust[i] · item[j] / T  −  log_q[item_ids[j]]
+
+    Without the log-Q term, in-batch negatives are drawn proportional to item
+    popularity, so the model is rewarded for demoting popular items and drifts
+    toward an inverted-popularity ranker. Targets are the diagonal.
+    """
+```
+
+| Setting | Value |
+|---|---|
+| Objective | In-batch sampled softmax, log-Q corrected |
+| `log_q` estimate | Streaming item-frequency counter over train positives, `log(count / total)` |
+| Batch | 512 positives — **batch size is the negative count** |
+| Optimizer | AdamW, discriminative LRs: **1e-3 towers, 2e-5 encoder** |
+| Schedule | 10% linear warmup, cosine decay |
+| Epochs | 2, val-selected by AUC on the val rows |
+| Device | `mps`, `--device cpu` fallback |
+| Seeds | 3 |
+
+**Training consumes positives only** (~520k), not the 5.7M sampled rows — in-batch negatives
+are free. At batch 512 that is ~1,000 steps/epoch, **≈4–6 min/epoch on MPS**, making these
+arms cheaper than the LightGBM arms.
+
+**Batch construction**: articles repeat across rows, so each batch dedupes article IDs,
+encodes unique texts once, and gathers — the same efficiency property as §8. Duplicate items
+within a batch are masked out of the negative set, since an item cannot be its own negative.
+
+### 9b.3 Arms
+
+| # | Arm | Encoder | Trained |
+|---|---|---|---|
+| 9 | `twotower_frozen` | frozen pretrained | towers only — article embeddings precomputed, so no encoder forward pass |
+| 10 | **`twotower_e2e`** | trained jointly | towers + encoder end-to-end |
+
+### 9b.4 Evaluation and the comparability boundary
+
+Arms 9/10 train on a different negative distribution than arms 1–8 (PRD §5, §7). Handling:
+
+| Metric class | Comparable? | Handling |
+|---|---|---|
+| AUC, PR-AUC, precision@k, MAP@12, NDCG | **Yes** | Scored on the identical test rows; the score is a dot product computable for any pair |
+| Log-loss, Brier, reliability | Not directly | Isotonic fit on **val** rows via `eval/calibration.py:fit_isotonic`, then applied to test. Prior correction does not apply — there is no fixed downsampling rate `w` for in-batch negatives |
+| Business proxy | After recalibration only | Needs probabilities, so it runs on isotonic-calibrated scores |
+
+The `10 − 7b` delta reflects **architecture and training objective together**. Reported with
+that caveat inline in `reports/results.md`, not as a clean neural-vs-GBDT isolation.
+
+### 9b.5 Diagnostics
+
+- **Popularity ρ** — Spearman between arm-10 scores and `log(art_pop_12w + 1)`. A two-tower
+  that has collapsed to popularity re-ranking fails here, and log-Q is the first thing to
+  check.
+- **log-Q ablation** — one run with the correction disabled, to demonstrate its effect rather
+  than assert it.
+- **Tower vector norms and pairwise cosine spread** — the same collapse check as §8.3.
+
+### 9b.6 Run matrix addition
+
+| Arms | Text variants | Seeds | Runs |
+|---|---|---|---|
+| 9, 10 | A, B | 3 | 12 |
+| Sensitivity: log-Q disabled on arm 10 | B | 1 | 1 |
+| | | | **13** |
+
+Total across the project: **48 + 13 = 61 runs**.
 
 ---
 
@@ -780,7 +904,7 @@ Every run **also** writes `reports/metrics/{run_name}.json`, which **is** commit
 
 `make report` regenerates the tables in `reports/results.md` from these files.
 **No number in the report is ever hand-typed**, and a metric change shows up as a reviewable
-diff. MLflow is for exploring the 48 runs; the JSON is the record of what was claimed.
+diff. MLflow is for exploring the 61 runs; the JSON is the record of what was claimed.
 
 ---
 
@@ -834,6 +958,7 @@ when its outputs exist with a matching config hash, unless `--force`.
 | `embed --variant a\|b --source frozen\|contrastive` | articles, checkpoint | `artifacts/emb/*` |
 | `finetune --variant a\|b --seed N` | transactions, articles | checkpoint, diagnostics |
 | `train --arm A --variant V --seed N` | features, rows | model, MLflow run, metrics JSON |
+| `train-twotower --arm 9\|10 --variant a\|b --seed N` | positives, articles, history | tower checkpoints, MLflow run, metrics JSON |
 | `evaluate --arm A ...` | model, features | metrics JSON, figures |
 | `bench --config C` | model, embedding cache | `reports/metrics/bench.json` |
 | `report` | `reports/metrics/*.json` | `reports/results.md` |
@@ -855,6 +980,7 @@ Against the 8 GB ceiling, with ~1.5 GB reserved for OS and overhead → **~6.5 G
 | `finetune` | **~1.5 GB** | 22M params × 4 (weights + grads + 2 Adam states) ≈ 350 MB, plus activations for 128 × 64 tokens |
 | `build-features` (taste) | **~1.5 GB** | Per-window; 80k × 384 float32 ≈ 123 MB, plus the 162 MB cache mmapped |
 | `train` (LightGBM) | **~3.5 GB** | See below |
+| `train-twotower` | **~3.0 GB** | 30M params (22M encoder + 6.7M item-ID table + ~1M towers) × 4 B × 4 Adam states ≈ 480 MB; activations for batch 512 with ~450 unique texts × 64 tokens ≈ 700 MB; history tensors negligible |
 | `evaluate` | **~1.5 GB** | Test window only, ~600k rows |
 
 ### The LightGBM budget in detail
@@ -886,6 +1012,7 @@ why it is an opt-in sensitivity run rather than a default.
 | M4 frozen embeddings + taste vectors + arms 4a/4b | 1.5 h |
 | M5 contrastive fine-tune (2 variants × 3 seeds) | 1.5 h |
 | M6 arms 7a/7b + sensitivity + bootstrap | 3–4 h |
+| M6b two-tower arms 9/10 (13 runs) | 2–3 h |
 | M7 calibration + business proxy | 45 min |
 | M8 cost profiling | 45 min |
 | M9 report | — |
@@ -935,6 +1062,16 @@ Windows are contiguous, non-overlapping, 14 days each; train `end` < val `start`
 | `test_determinism` | Two runs at the same seed produce byte-identical Parquet |
 | `test_popularity_weighting` | Over many draws, empirical frequency ∝ weight^0.75 within tolerance |
 
+### `tests/test_twotower.py`
+
+| Test | Assertion |
+|---|---|
+| `test_customer_tower_is_item_independent` | `CustomerTower.forward` accepts no item argument, and its output is bit-identical for the same customer across different candidate batches. This is what keeps both towers precomputable and the §12 serving analysis valid |
+| `test_logq_correction_applied` | With a synthetic skewed item distribution, corrected logits recover uniform expected ranking; uncorrected ones do not |
+| `test_in_batch_duplicates_masked` | An item appearing twice in a batch is never its own negative |
+| `test_history_mask_respects_as_of` | Deletion-invariance (§15) applied to history construction — no purchase at or after `W.start` enters `hist_ids` |
+| `test_output_is_l2_normalized` | Both tower outputs have unit norm within tolerance |
+
 ### `tests/test_calibration.py`
 
 `prior_correct` round-trips on synthetic data: given a known base rate and downsampling
@@ -954,12 +1091,13 @@ correction is strictly monotone, so AUC is unchanged.
 | **M4** | Frozen embeddings, taste vectors, arms 4a/4b | `test_leakage.py` still green | Δ(4b − 4a): does personalization help at all |
 | **M5** | Contrastive checkpoints | Collapse check passes | `diag/spearman_pop`, NN dumps |
 | **M6** | Arms 7a/7b + sensitivity | Full grid complete | **All three deltas with 95% CIs, all three slices, plus the H2 delta-of-deltas** |
-| **M7** | Calibration + business proxy | `test_calibration.py` green | Corrected log-loss, Brier, AOV lift ratio |
+| **M6b** | Two-tower arms 9/10 | **`test_twotower.py` green**; collapse + popularity-ρ checks pass | **H3 delta with 95% CI**, plus the log-Q ablation |
+| **M7** | Calibration + business proxy | `test_calibration.py` green | Corrected log-loss, Brier, AOV lift ratio, isotonic recalibration of arms 9/10 |
 | **M8** | Benchmark results | — | Latency table, $/1M, measured `nbytes` |
 | **M9** | `reports/results.md`, `README.md` | `make report` reproduces every number | **The §1 verdict: supported or null** |
 
 **M1 gates everything** — no model is trained until the leakage tests pass (PRD §11).
 
 **M9 is the only point at which the test split is read.** M3–M8 report validation-split
-numbers; the test split is evaluated once, at the end, and the §1 pre-registered criterion
-is applied to that single evaluation.
+numbers; the test split is evaluated once, at the end, and **all three** §1 pre-registered
+criteria (H1, H2, H3) are applied to that single evaluation.

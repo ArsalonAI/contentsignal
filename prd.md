@@ -38,6 +38,17 @@ This project answers that question end to end on public data, then prices the an
 H2 is the substantively interesting claim, and registering it in advance is what separates a
 prediction that survived from a story assembled after seeing the slice table.
 
+### Hypothesis (H3) — architecture
+
+> An end-to-end two-tower neural ranker, trained jointly over customer history and product
+> text, outperforms the staged pipeline (contrastive pre-train → freeze → LightGBM).
+
+**Registered prior: I expect H3 to fail on aggregate.** Gradient-boosted trees typically beat
+neural rankers on tabular-dominant problems at this data scale, and stating that expectation
+in advance is what makes either outcome informative. The interesting case is H3 failing on
+all rows while holding on **cold-start** — the same shape as H2, and for the same reason: the
+text pathway carries the most weight exactly where tabular features are weakest.
+
 ### Pre-registered success criteria
 
 Fixed **before any model is run**, so results cannot be rationalized after the fact. Both
@@ -55,7 +66,13 @@ are judged on the held-out test split.
 2. the **95% bootstrap CI on that difference of deltas excludes zero**, computed on shared
    customer resamples (`trd.md` §10.2).
 
-Anything less, on either, is a **null result** for that hypothesis.
+**H3 is supported** only if both hold:
+
+1. **ΔAUC ≥ 0.005** (end-to-end two-tower minus the staged GBDT pipeline, arm 10 − arm 7b),
+   and
+2. the **95% bootstrap CI on ΔAUC excludes zero**.
+
+Anything less, on any of the three, is a **null result** for that hypothesis.
 
 **The two are independent.** H1 can fail while H2 holds — text contributing nothing on
 aggregate but real lift where popularity is blank. That combination is a more useful finding
@@ -226,10 +243,16 @@ truncated at `W.start`; if the value changes, the feature leaks.*
 | Candidate pool | Articles with ≥1 transaction before `W.start` | No future catalog (§4) |
 | Seed | Fixed, in `conf/data.yaml` | Reproducibility |
 
-**The sampled dataset is materialized to disk once and reused byte-identically by every
-arm.** No arm resamples. This makes ablation deltas attributable to the model, not to
-sampling noise — without it, ΔAUC of 0.005 is indistinguishable from a different random
-draw.
+**The sampled dataset is materialized to disk once and reused byte-identically by arms
+1–8.** None of those arms resamples. This makes ablation deltas attributable to the model,
+not to sampling noise — without it, ΔAUC of 0.005 is indistinguishable from a different
+random draw.
+
+> **The one exception.** Arms 9 and 10 (two-tower) train with in-batch sampled softmax, whose
+> negative distribution is by construction different from these materialized rows. They are
+> **evaluated on the identical test rows** so ranking metrics stay comparable, but their
+> training data differs and their deltas carry the attribution caveat in §7. This exception
+> is deliberate, bounded to two arms, and stated everywhere the invariant is stated.
 
 Uniform sampling is run **once** as a sensitivity check and reported in an appendix, not as
 a headline arm.
@@ -357,14 +380,19 @@ Two orthogonal axes — **embedding source** (frozen vs fine-tuned) and **text f
 | 7a | LightGBM + fine-tuned | contrastive | item-side | Fine-tuning's value on item-side features alone |
 | 7b | **LightGBM + fine-tuned** | contrastive | item + personalized | **Headline combined arm** |
 | 8 | Text-only encoder | contrastive | — | Text-alone ceiling reference |
+| 9 | Two-tower, frozen encoder | pretrained | learned towers | Value of the tower architecture alone |
+| 10 | **Two-tower, end-to-end** | trained jointly | learned towers | **Headline neural arm** (§7b below) |
 
-Three deltas, each reported for **Text-A** and **Text-B** separately:
+Deltas, each reported for **Text-A** and **Text-B** separately:
 
 | Delta | Isolates |
 |---|---|
 | **7b − 3** | **The headline.** Total lift from product content over tabular alone |
 | 7b − 7a | The contribution of **personalization** — the taste vector and similarity features |
 | 7b − 4b | The contribution of **fine-tuning** — if ≈ 0, a frozen off-the-shelf encoder sufficed, which changes the cost story in §9 substantially |
+| **10 − 7b** | **H3.** End-to-end learned interaction vs the staged pipeline |
+| 10 − 9 | What end-to-end encoder training adds over frozen, inside the tower architecture |
+| 9 − 3 | Whether a neural ranker beats GBDT on this problem at all |
 
 ### Encoder configuration
 
@@ -413,6 +441,55 @@ encoder ever reading a customer column.
 After fine-tuning, the encoder is **frozen** and all 105k article embeddings are
 **precomputed once** to a lookup table. Everything downstream — LightGBM training,
 evaluation, and the serving benchmark — reads from that table.
+
+### Two-tower neural ranker (arms 9 and 10)
+
+The only arms with a learned interaction between customer and item. Both towers project to
+**128 dimensions, L2-normalized**; the score is a temperature-scaled dot product.
+
+**Item tower** — product text → MiniLM → 384 → projection; 11 taxonomy categoricals →
+embedding layers; article numerics standardized; concat → MLP [512, 256] → 128.
+
+**Customer tower** — a learned item-ID embedding table (105k × 64); the customer's last 20
+purchased article IDs → embeddings → **self-attentive pooling with a learned query**, masked
+for variable-length history; customer categoricals and numerics; concat → MLP [512, 256] →
+128.
+
+> **The attention must not be candidate-aware.** Conditioning history attention on the
+> candidate item would let the model weight past purchases per candidate — almost certainly
+> more accurate — but it **breaks the two-tower factorization**. Customer vectors could no
+> longer be precomputed independently of the item, which destroys the retrieval property and
+> invalidates the serving-cost analysis in §9 outright. Self-attentive pooling with a learned
+> query keeps both towers independently precomputable. This is a deliberate accuracy-for-
+> deployability trade, not an implementation shortcut.
+
+**Training objective: in-batch sampled softmax**, the standard two-tower retrieval
+formulation — each positive's in-batch companions serve as its negatives. Corrected with
+**log-Q**: `logits −= log P(sample item)`, estimated from streaming item frequency (Yi et
+al., RecSys 2019). Without it, in-batch negatives are drawn proportional to popularity and
+the model drifts toward a popularity ranker — the same contamination guarded against in §5
+sampling and §7 pair caps.
+
+Batch 512 positives (batch size *is* the negative count), AdamW with **discriminative
+learning rates** — 1e-3 for the freshly initialized towers, 2e-5 for the pretrained encoder —
+2 epochs, 3 seeds.
+
+Note that softmax training consumes **positives only** (~520k, not the 5.7M sampled rows), so
+these arms are *cheaper* to train than the LightGBM arms: ~1,000 steps/epoch, ~4–6 minutes
+per epoch on MPS.
+
+> **⚠️ Comparability caveat, stated rather than buried.** Arms 9 and 10 do **not** read the
+> same training distribution as arms 1–8, because in-batch softmax negatives differ from the
+> materialized 1:10 popularity-weighted rows. Consequences:
+>
+> - **Evaluation is still on the identical test rows.** The score is a dot product,
+>   computable for any (customer, article) pair — so **AUC, precision@k, MAP@12 and NDCG
+>   remain directly comparable** across all ten arms.
+> - **Probability metrics require recalibration.** Softmax logits are not calibrated
+>   probabilities; isotonic regression is fit on validation before log-loss and Brier.
+> - **The 10 − 7b delta is a package deal.** These arms differ in *both* architecture and
+>   training objective, so the delta is not a clean neural-vs-GBDT isolation.
+>   `reports/results.md` must say so.
 
 ### Embedding → LightGBM
 
@@ -551,7 +628,8 @@ contentsignal/
 | **M4** | Frozen-embedding arms (4a, 4b) | Embedding cache, taste vectors, updated results table |
 | **M5** | Contrastive fine-tune (arm 8) | Checkpoint, fine-tuned embedding cache, NN dumps + popularity-ρ diagnostic |
 | **M6** | Full grid, ablations, bootstrap CIs (arms 7a, 7b) | **Ablation grid with 95% CIs on all three deltas, across all three slices** |
-| **M7** | Calibration + business proxy | Reliability curves, AOV lift ratios |
+| **M6b** | Two-tower arms (9, 10) | Trained towers, log-Q correction verified, **H3 delta with 95% CI** |
+| **M7** | Calibration + business proxy | Reliability curves, AOV lift ratios, isotonic recalibration of arms 9/10 |
 | **M8** | Cost profiling | Latency/throughput table, $/1M predictions |
 | **M9** | Report | Final `reports/results.md`, `README.md` |
 
@@ -571,6 +649,9 @@ M1 gates everything: **no model is trained until the leakage tests pass.**
 | **Fine-tune too slow** | Deduplicated item-level batching (§7) — the single largest speedup available. Fall back to shorter `max_len` or 1 epoch |
 | **Kaggle download blocked** | Requires accepting the competition rules on Kaggle **and** placing `kaggle.json` at `~/.kaggle/` — currently absent on this machine. M0 is blocked until then |
 | **Popularity baseline wins** | Report it. It is a real and frequently observed outcome on implicit-feedback data, and concealing it would invalidate the rest |
+| **Two-tower loses to LightGBM** | Expected, and pre-registered as such (H3's stated prior). GBDTs usually win on tabular-dominant problems at this scale. Arms 9 and 10 separate "tower architecture" from "end-to-end encoder training," so a loss is still diagnostic |
+| **In-batch negatives collapse toward popularity** | log-Q correction (§7). Verified by the same Spearman-ρ-vs-popularity diagnostic used for the contrastive encoder; a two-tower that merely re-ranks by popularity fails the check |
+| **Two-tower comparability confound** | Arms 9/10 differ from 7b in architecture *and* objective. Not fixable within this design — mitigated by stating it inline in the results table rather than presenting the delta as a clean isolation |
 
 ---
 
@@ -584,9 +665,9 @@ Stated plainly so scope creep is visible when it happens:
 - **Online A/B testing.** No live traffic exists. All business metrics are offline proxies
   and are labeled as such.
 - **Serving infrastructure.** §9 benchmarks a local predictor; it does not build an API.
-- **A learned customer tower.** The taste vector is a fixed mean-pool of item embeddings,
-  not a trained customer encoder. A true two-tower model is a larger project and would make
-  the encoder's marginal contribution harder to isolate, which is the whole point here.
+- **Candidate-aware interaction models.** No cross-attention or DLRM-style feature crossing
+  between customer and item. Both towers must remain independently precomputable, or the
+  serving-cost analysis in §9 no longer describes a deployable system (§7).
 - **Dollar-denominated AOV.** Impossible with scaled prices (§2).
 - **Beating the Kaggle leaderboard.** MAP@12 is reported for calibration against known
   results, not as a target to optimize.

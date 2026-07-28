@@ -104,10 +104,22 @@ Feature code reads transactions only through `features.base.history(txns, as_of=
 Never add an overload or default that permits reading without a cutoff — the signature is
 the enforcement mechanism (`trd.md` §5.1).
 
-**Row sets are byte-identical across arms.** `artifacts/rows/{window}.parquet` is written
-once and digested in `rows_manifest.json`; every arm asserts the digest before training.
+**Row sets are byte-identical across arms 1–8.** `artifacts/rows/{window}.parquet` is written
+once and digested in `rows_manifest.json`; those arms assert the digest before training.
 Never resample per arm — a ΔAUC of 0.005 is otherwise indistinguishable from a different
 random draw (`trd.md` §4.5).
+
+**The one bounded exception: arms 9/10 (two-tower)** train with in-batch sampled softmax, so
+their negative distribution differs by design. They still assert the same digest before
+*evaluation*, since they are scored on the identical test rows. Ranking metrics stay
+comparable; probability metrics need isotonic recalibration; and the H3 delta covers
+architecture and objective together, which must be stated wherever it is reported
+(`trd.md` §9b.4). Do not extend this exception to any other arm.
+
+**Both towers must stay independently precomputable.** `CustomerTower.forward` takes no item
+argument. Candidate-aware attention would score better but breaks the two-tower
+factorization, which voids the serving-cost analysis the project exists to produce
+(`prd.md` §7, `trd.md` §9b.1).
 
 **The tabular baseline receives all eleven categorical columns.** Withholding them while
 feeding the same information to the encoder as text credits the encoder with information
@@ -120,11 +132,13 @@ confounds "better features" with "more tuning budget" (`trd.md` §9.4).
 **`max_bin=63` is a memory requirement, not a tuning choice.** It takes the 5M × 80 matrix
 from 1.6 GB raw to 400 MB binned, which is what makes LightGBM fit in 8 GB (`trd.md` §14).
 
-**The test split is read once, at M9.** M3–M8 report validation numbers. **Both**
-pre-registered criteria are applied to that single evaluation — H1 (ΔAUC ≥ 0.005 with a
-customer-level bootstrap CI excluding zero) and H2 (ΔAUC on cold-start exceeds ΔAUC on all
-rows, CI on the difference of deltas excluding zero). Evaluating one and quietly dropping
-the other defeats the point of registering them (`prd.md` §1).
+**The test split is read once, at M9.** M3–M8 report validation numbers. **All three**
+pre-registered criteria are applied to that single evaluation — H1 (ΔAUC ≥ 0.005, bootstrap
+CI excluding zero), H2 (ΔAUC on cold-start exceeds ΔAUC on all rows, CI on the difference of
+deltas excluding zero), and H3 (end-to-end two-tower beats the staged pipeline, same bar as
+H1). H3 carries a **registered prior that it will fail** — that prior is part of the record
+and must not be quietly dropped if the result goes the other way. Evaluating some hypotheses
+and skipping others defeats the point of registering them (`prd.md` §1).
 
 **Bootstrap resamples customers, not rows.** Rows within a customer share history features
 and basket composition; row-level resampling gives CIs narrow enough for noise to clear the
