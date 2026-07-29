@@ -491,13 +491,16 @@ Stated here rather than discovered later.
 uv sync                                  # Python 3.11; system 3.9 cannot be used
 uv run pytest                            # the invariant harness — green before any data exists
 uv run contentsignal splits              # print the window table with roles
+uv run contentsignal ingest              # CSV -> Parquet; ~10 s, 1.6 GB peak RSS
 uv run contentsignal --help
 ```
 
 `make m1` … `make m9` chain the pipeline to match milestones. Every command is idempotent and
 skips work when its outputs exist with a matching config hash, unless `--force`.
 
-**Data access requires two manual steps** — accept the competition rules on Kaggle, and place
-`kaggle.json` at `~/.kaggle/` with mode `600`. The API returns 403 until the rules are accepted,
-even with a valid token, so `ingest` checks both and names them separately before starting a
-multi-GB download.
+**Data.** `ingest` looks in `data/` first and converts whatever is there, so the three CSVs can be
+dropped in by hand. If a file is missing it falls back to the Kaggle API, which requires two manual
+steps — accept the competition rules, and place `kaggle.json` at `~/.kaggle/` with mode `600`. The
+API returns 403 until the rules are accepted even with a valid token, so `ingest` checks both and
+names them separately before starting a multi-GB download. The credential check runs *only* on that
+path: converting CSVs that are already on disk needs no token.

@@ -215,6 +215,17 @@ def conf_dir() -> Path:
     return Path(override) if override else repo_root() / "conf"
 
 
+def resolve_path(p: Path) -> Path:
+    """Absolute path for a config path, anchored at the repo root rather than the cwd.
+
+    `conf/data.yaml` stores paths relative to the repo (`raw: data`) so the config stays
+    portable, but the CLI runs from anywhere. Anchoring on `repo_root()` — the same way
+    `conf_dir()` does — is what keeps `contentsignal ingest` reading the same `data/`
+    directory whether it is invoked from the repo or from a notebook two levels down.
+    """
+    return p if p.is_absolute() else repo_root() / p
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"config not found: {path}")

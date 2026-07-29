@@ -54,18 +54,26 @@ machine; that is why DuckDB and Polars are requirements rather than preferences.
 `faiss-cpu` is an **optional extra**, installed only for the §12 exact-versus-approximate
 comparison. The pipeline never depends on it — that is the point of the measurement.
 
-### Blocker
+### Data acquisition
 
-M0 cannot complete until:
+The three CSVs live in `data/` (gitignored) and were placed there directly, so **M0 is not
+blocked**. `ingest` checks `data/` first and only reaches for Kaggle when a file is genuinely
+absent — requiring a token to convert CSVs that are already on disk blocks the stage on a step
+with nothing left to do.
 
-1. The H&M competition rules are accepted at
+The download path is retained for a fresh clone, and needs two things the local path does not:
+
+1. The H&M competition rules accepted at
    `https://www.kaggle.com/c/h-and-m-personalized-fashion-recommendations/rules`. The API
    returns 403 until this is done, even with a valid token.
-2. `~/.kaggle/kaggle.json` exists with mode `600`.
+2. `~/.kaggle/kaggle.json` at mode `600`.
 
-Neither is true on this machine. `cli.check_kaggle_credentials` fails fast on both, naming them
-separately, because a missing token and unaccepted rules both surface as an indistinguishable
-403 much later in the download.
+`cli.check_kaggle_credentials` fails fast on both, naming them separately, because a missing
+token and unaccepted rules both surface as an indistinguishable 403 much later in the download.
+
+`ingest` does **not** delete the raw CSVs after conversion. Re-acquiring them costs 30–60 min of
+network, and deleting a hand-supplied input is not the pipeline's call; reclaiming the 3.5 GB is
+manual.
 
 ---
 
@@ -214,7 +222,13 @@ CLI idempotent (§13).
 | `price` | `float32` |
 | `sales_channel_id` | `int8` |
 
-Sorted by `t_dat`, then `customer_idx`. Row-group size 256 MB.
+Sorted by `t_dat`, then `customer_idx`.
+
+**Row groups are 2M rows (~34 MB), not the 256 MB this section originally specified.** At 17 B/row
+256 MB is 15.8M rows, which is two row groups for the whole table and makes the per-group `t_dat`
+min/max statistics useless for exactly the `as_of` range pruning the sort order exists to enable.
+2M rows yields 16 groups, each spanning weeks rather than years. Measured: 183 MB on disk for
+31,788,324 rows.
 
 ### 4.2 `artifacts/parquet/articles.parquet`
 
@@ -1055,7 +1069,7 @@ Against the 8 GB ceiling, with ~1.5 GB reserved for OS and overhead → **~6.5 G
 
 | Stage | Peak RSS | How it stays bounded |
 |---|---|---|
-| `ingest` | **~1.5 GB** | DuckDB streams CSV → Parquet; 31.8M rows never materialize |
+| `ingest` | **~1.5 GB** — measured 1.58 GB | DuckDB streams CSV → Parquet under a 2 GB `memory_limit`, spilling the sort to `artifacts/tmp`; 31.8M rows never materialize |
 | `sample` | **~1.2 GB** | Per-window; alias table ~60k entries; positives ~65k |
 | `build-features` (tabular) | **~2.5 GB** | Per-window DuckDB aggregation, Polars result only |
 | `train-retriever` | **~3.0 GB** | ~30M params (22M encoder + 6.7M customer-ID table + ~1M towers) × 4 B × 4 Adam states ≈ 480 MB; activations for batch 512 with ~450 unique texts × 64 tokens ≈ 700 MB |
@@ -1085,8 +1099,8 @@ the transient raw matrix during construction (~2.0 GB peak). Dropping the 32 emb
 
 | Milestone | Estimate |
 |---|---|
-| M0 install + download | 30–60 min (network-bound) |
-| M1 ingest + EDA + leakage tests | 45 min |
+| M0 install + download | 30–60 min (network-bound); ~0 when the CSVs are supplied directly |
+| M1 ingest + EDA + leakage tests | 45 min — ingest itself measured at 10 s |
 | M2 cohort, positives, features (10 windows) | 1.5–2 h |
 | M3 retrievers (`R1`, `R2`, `R2-A`, log-Q ablation) | 1.5–2 h |
 | M4 retrieval eval + `K` sweep + bootstrap | 45 min |
