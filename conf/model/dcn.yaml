@@ -1,0 +1,44 @@
+# Stage 2 — DCN-v2 ranker (trd.md §9b.3).
+#
+# The cross layers explicitly multiply feature pairs:
+#
+#     x_{l+1} = x_0 * (W_l x_l + b_l) + x_l
+#
+# so the model can discover interactions like `cust_age x index_group` without them being
+# hand-written. THAT IS THE COMPARISON: `dcn` vs `mlp` measures learned feature crossing
+# against the six hand-built crosses in the `cross` feature group (trd.md §6.4), on
+# identical inputs and an identical training budget.
+#
+# Parallel structure — both stacks read the same input x_0, and their outputs are
+# concatenated into a single linear head. The alternative (stacked: cross then deep) makes
+# the deep stack's input depend on cross depth, which muddies the comparison against `mlp`.
+
+structure: parallel
+n_cross_layers: 3
+cross_rank: null                  # full W. The low-rank variant exists for wide industrial
+                                  # inputs; at input dim ~190 a full 190x190 layer is ~36k
+                                  # params, so three layers plus the deep stack is ~400k
+                                  # total. The rankers are tiny — memory here is dominated
+                                  # by the data, not the model.
+
+deep_hidden: [512, 256]
+activation: gelu
+dropout: 0.1
+batch_norm_numerics: true
+
+cat_embed_dim_min: 8
+cat_embed_dim_max: 16
+
+# Identical to mlp.yaml. If these diverged, the dcn - mlp delta would bundle "learned
+# crossing" together with "different training budget" and measure neither.
+training:
+  loss: bce
+  batch_size: 4096
+  epochs: 3
+  early_stopping_metric: ndcg_at_12
+  lr: 1.0e-3
+  schedule: cosine
+  warmup_frac: 0.1
+  weight_decay: 0.01
+  device: mps
+  seeds: [1, 2, 3]

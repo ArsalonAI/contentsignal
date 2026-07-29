@@ -1,0 +1,31 @@
+# Stage 2 — MLP ranker (trd.md §9b.2).
+#
+# The baseline for the `dcn` comparison: same inputs, same training budget, no explicit
+# feature crossing. Whatever interactions it finds, it finds implicitly through depth.
+#
+# Hyperparameters are inherited from lgbm.yaml where they apply and otherwise frozen at
+# these values. Not tuned (trd.md §9b.4).
+
+hidden: [512, 256, 128]
+activation: gelu
+dropout: 0.1
+batch_norm_numerics: true         # numeric scales differ by orders of magnitude
+
+# Embedding tables for the 13 categorical fields — the 11 article taxonomy columns plus
+# club_member_status and fashion_news_frequency. Total ~600 distinct values, so the tables
+# are negligible next to the data.
+cat_embed_dim_min: 8
+cat_embed_dim_max: 16
+
+training:
+  loss: bce
+  batch_size: 4096                # streamed from Parquet; the design matrix is never
+                                  # materialized, which is what keeps peak RSS ~1.5 GB
+  epochs: 3
+  early_stopping_metric: ndcg_at_12
+  lr: 1.0e-3
+  schedule: cosine
+  warmup_frac: 0.1
+  weight_decay: 0.01
+  device: mps
+  seeds: [1, 2, 3]

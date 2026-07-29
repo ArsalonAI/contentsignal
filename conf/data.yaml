@@ -1,0 +1,66 @@
+# Paths, cohort, candidate generation, and negative sampling (trd.md §3.2, §3.4, §8).
+
+paths:
+  raw: data                       # Kaggle CSVs; deleted after parquet conversion
+  artifacts: artifacts
+  parquet: artifacts/parquet
+  candidates: artifacts/candidates # top-K per customer per window; written once, digested
+  rows_random: artifacts/rows_random  # random-negative rows — the H3 arm only
+  features: artifacts/features
+  vectors: artifacts/vectors      # item vectors from the frozen item tower (.npy + ids.npy)
+  mlruns: artifacts/mlruns
+
+kaggle:
+  competition: h-and-m-personalized-fashion-recommendations
+
+cohort:
+  # Drawn once from customers with >= 1 transaction in the qualifying range, then
+  # persisted and reused by every window and every arm (trd.md §3.2).
+  size: 150_000                   # initial guess; adjusted once, before any arm is trained
+  seed: 17
+  qualify_start: 2020-03-24
+  qualify_end: 2020-09-22
+
+candidates:
+  # Candidate depth. `k` drives the main grid; `k_sweep` is evaluated from a SINGLE
+  # retrieval pass at max(k_sweep) by truncation — no retraining, no re-retrieval. That is
+  # why the retrieval half of H1 is cheap relative to its ranker half (trd.md §10.3).
+  k: 100
+  k_sweep: [20, 50, 100, 200, 500, 1000]
+
+  # The binding scale constraint is the row budget, not the cohort size (trd.md §3.4).
+  # Ranker rows scale as windows x customers x k, so they grow fast. `retrieve` measures
+  # actual counts and fails if ranker training rows exceed this by more than the tolerance,
+  # naming the `train_customer_cap` that would fit.
+  target_train_rows: 5_000_000
+  row_budget_tolerance: 0.2
+
+  # Max customers per RANKER-role window, drawn under `cohort.seed`. Set once at M5 from
+  # measured counts; null means uncapped.
+  #
+  # val and test are never capped — evaluation must not be conditioned on a budget
+  # decision, or the customer-level bootstrap silently narrows and with it every
+  # confidence interval the hypotheses are judged on.
+  train_customer_cap: null
+
+sampler:
+  # Random negatives, for the H3 candidate-distribution-shift arm only (trd.md §8.3).
+  # The main grid's negatives are the retriever's top-K non-purchases.
+  ratio: 10                       # negatives per positive
+  pop_exponent: 0.75              # weight = (pop_12w + 1) ** 0.75
+  pop_lookback_weeks: 12
+  seed: 17
+
+eval:
+  # Slice boundaries are set ONCE at M1 from the measured distributions and registered.
+  # Retuning a slice after seeing results is p-hacking with extra steps (trd.md §10.5).
+  cold_start_threshold: 10        # art_prior_purchases < this  ->  art_is_cold
+  low_history_threshold: 3        # cust_txn_12w <= this        ->  low-history slice
+
+  # Resampling CUSTOMERS, not rows: rows within a customer share history features and
+  # basket composition, so row-level resampling treats correlated observations as
+  # independent and produces intervals narrow enough for noise to clear any bar
+  # (trd.md §10.6).
+  bootstrap_resamples: 1000
+  bootstrap_seed: 17
+  ndcg_k: 12

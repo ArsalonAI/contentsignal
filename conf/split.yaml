@@ -1,0 +1,39 @@
+# The single source of truth for window boundaries and roles (trd.md §3.1).
+#
+# No module hardcodes these dates. Ten contiguous, non-overlapping 14-day windows ending on
+# the dataset's last day. All bounds inclusive.
+#
+# Two orthogonal labels per window:
+#
+#   `split` — the ML split: train / val / test.
+#   `role`  — what a train window is FOR. The retriever is itself a trained model, so it
+#             needs its own leakage boundary: a retriever trained on a window it later
+#             retrieves candidates for has memorized that window's labels and will rank them
+#             first, for a reason that never holds at serving time. Roles enforce the
+#             separation (prd.md §5).
+#
+#   ret_w1..4  → train the two-tower retriever (positives only)
+#   rank_w1..4 → train the rankers, on candidates from the FROZEN retriever
+#   val        → early stopping, isotonic calibration, all M3–M8 reporting
+#   test       → read once, at M9
+#
+# Every feature for a row in window W is computed strictly from transactions before
+# W.start; `Window.as_of` is that cutoff and it is exclusive.
+
+window_length_days: 14
+
+# Feature history reaches back to the dataset's first transaction.
+dataset_start: 2018-09-20
+dataset_end: 2020-09-22
+
+windows:
+  - {name: ret_w1,  split: train, role: retriever, start: 2020-05-06, end: 2020-05-19}
+  - {name: ret_w2,  split: train, role: retriever, start: 2020-05-20, end: 2020-06-02}
+  - {name: ret_w3,  split: train, role: retriever, start: 2020-06-03, end: 2020-06-16}
+  - {name: ret_w4,  split: train, role: retriever, start: 2020-06-17, end: 2020-06-30}
+  - {name: rank_w1, split: train, role: ranker,    start: 2020-07-01, end: 2020-07-14}
+  - {name: rank_w2, split: train, role: ranker,    start: 2020-07-15, end: 2020-07-28}
+  - {name: rank_w3, split: train, role: ranker,    start: 2020-07-29, end: 2020-08-11}
+  - {name: rank_w4, split: train, role: ranker,    start: 2020-08-12, end: 2020-08-25}
+  - {name: val,     split: val,   role: val,       start: 2020-08-26, end: 2020-09-08}
+  - {name: test,    split: test,  role: test,      start: 2020-09-09, end: 2020-09-22}

@@ -1,136 +1,141 @@
 # ContentSignal — TRD
 
-Technical design for the experiment specified in [`prd.md`](./prd.md). The PRD defines
-*what* and *why*; this document defines *how*, at a level where implementation is
-mechanical: literal schemas, function signatures, algorithms, resource budgets, and test
-assertions.
+The engineering specification for the two-stage system defined in `prd.md`. Schemas,
+signatures, algorithms, resource budgets, and test assertions — precise enough that
+implementation is mechanical.
 
-| | |
-|---|---|
-| Status | Draft — pre-implementation |
-| Companion | `prd.md` (approved) |
-| Python | 3.11 via `uv` |
-| Hard ceiling | 8 GB RAM, 8 cores, MPS, no discrete GPU |
+Where a decision has a non-obvious reason, the reason is stated. Deviating from these contracts
+silently breaks the validity of the experiment rather than merely its style.
 
 ---
 
 ## 1. Traceability
 
-Every PRD section maps to at least one section here. Nothing is allowed to drop silently.
-
-| PRD § | Requirement | Implemented in |
-|---|---|---|
-| §1 | Pre-registered criterion, null-result commitment | §10 (bootstrap), §11 (immutable metric artifacts), §16 |
-| §2 | Data, ingest, dtypes, bounded subset | §4, §13 (`ingest`), §14 |
-| §3 | Label definition | §3 (row-set construction) |
-| §4 | Temporal splits, `as_of` contract, leakage | §3, §5 (`features/base.py`), §15 |
-| §5 | Negative sampling, prior correction | §7, §10.3 |
-| §6 | Feature groups incl. customer-side text | §6 |
-| §7 | Arm grid, contrastive fine-tune | §8, §9 |
-| §7 | Two-tower architecture, sampled softmax, log-Q | §9b, §15 (`test_twotower.py`) |
-| §8 | Metrics, bootstrap, slices, business proxy | §10 |
-| §9 | Inference cost profiling | §12 (`bench`), §4 (mmap-able artifacts) |
-| §10 | Repo layout | §5, §13 |
-| §11 | Milestones | §16 |
-| §12 | Risks | §14 (memory), §15 (leakage), §8 (pair bias) |
-| §13 | Non-goals | — (constraints on §8, §9) |
+| PRD requirement | Where it is implemented |
+|---|---|
+| §1 two-stage architecture, factorized towers | §5.3 `models/twotower.py`, §5.4 `retrieval/index.py`, §9 training |
+| §2 H1 stage attribution | §12.4 the stage-attribution table, §10.3 the K sweep |
+| §2 H2 content retrieval / cold start | §9.3 retriever arms, §10.2 retrieval metrics |
+| §2 H3 candidate distribution shift | §8.3 random negatives, §10.4 end-to-end metrics |
+| §5 `as_of` contract | §5.1 — the load-bearing interface |
+| §5 window roles, retriever precedence | §3.1, §15 `test_retriever_windows_precede_candidate_windows` |
+| §7 frozen byte-identical candidate set | §4.5 `candidates_manifest.json`, §8.2 |
+| §8 end-to-end counts unretrieved positives | §10.4, §15 `test_e2e_metrics_count_unretrieved_positives` |
+| §8 customer-level bootstrap | §10.6 `eval/bootstrap.py` |
+| §9 per-stage cost profiling | §12 `serving/benchmark.py` |
+| §3 row budget measured, not assumed | §3.4, §8.2 |
 
 ---
 
 ## 2. Environment & dependencies
 
-System Python is 3.9.6 and cannot be used. The project pins **3.11** via `uv`
-(`/opt/homebrew/bin/uv` is present).
+**Python 3.11 via `uv`.** System Python is 3.9.6 and cannot be used.
 
 ```toml
 # pyproject.toml — requires-python = ">=3.11,<3.12"
 dependencies = [
-  "polars>=1.0",           # in-memory frames
-  "duckdb>=1.0",           # out-of-core aggregation
-  "pyarrow>=16",           # parquet IO
-  "numpy>=1.26",
-  "lightgbm>=4.3",
-  "scikit-learn>=1.5",     # logreg, isotonic, TruncatedSVD
-  "torch>=2.3",            # MPS backend
-  "transformers>=4.40",
-  "sentence-transformers>=3.0",
-  "mlflow>=2.14",
-  "pydantic>=2.7",         # config validation
-  "pyyaml>=6.0",
-  "typer>=0.12",           # CLI
-  "scipy>=1.13",           # spearmanr, alias sampling support
+  "polars", "duckdb", "pyarrow",          # frames and out-of-core aggregation
+  "numpy", "scipy", "scikit-learn",        # metrics, isotonic regression
+  "lightgbm",                              # the tabular ranker baseline
+  "torch", "transformers",                 # towers and the text encoder
+  "sentence-transformers",                 # MiniLM checkpoint loading
+  "mlflow",                                # tracking (local file backend)
+  "typer", "pydantic", "pyyaml",           # CLI and typed config
+  "kaggle",                                # dataset download
 ]
-
 [project.optional-dependencies]
-bench = ["onnxruntime>=1.18", "optimum>=1.20"]   # §12 only
-dev   = ["pytest>=8.0", "pytest-xdist", "ruff", "mypy"]
+bench = ["faiss-cpu", "optimum", "onnxruntime"]   # §12 only
 ```
 
-`pandas` is **not** a dependency of the pipeline. It arrives transitively via MLflow and is
-permitted only in notebooks and report generation.
+`pandas` is **not** a pipeline dependency. It arrives transitively via MLflow and is permitted
+only in notebooks and report generation. 31.8M transaction rows do not fit in pandas on this
+machine; that is why DuckDB and Polars are requirements rather than preferences.
+
+`faiss-cpu` is an **optional extra**, installed only for the §12 exact-versus-approximate
+comparison. The pipeline never depends on it — that is the point of the measurement.
 
 ### Blocker
 
-M0 cannot start until: (a) the H&M competition rules are accepted on Kaggle, and (b)
-`~/.kaggle/kaggle.json` exists with mode `600`. Neither is true on this machine as of
-2026-07-27. `contentsignal ingest` fails fast with a specific message if either is missing.
+M0 cannot complete until:
+
+1. The H&M competition rules are accepted at
+   `https://www.kaggle.com/c/h-and-m-personalized-fashion-recommendations/rules`. The API
+   returns 403 until this is done, even with a valid token.
+2. `~/.kaggle/kaggle.json` exists with mode `600`.
+
+Neither is true on this machine. `cli.check_kaggle_credentials` fails fast on both, naming them
+separately, because a missing token and unaccepted rules both surface as an indistinguishable
+403 much later in the download.
 
 ---
 
-## 3. Windowing and row-set construction
+## 3. Windowing, cohort, and scale
 
-### 3.1 Window geometry
+### 3.1 Window geometry and roles
 
-Window length **L = 14 days**, chosen so train windows are directly comparable to val and
-test. All bounds inclusive.
+Ten contiguous, non-overlapping 14-day windows read from `conf/split.yaml` — the single source
+of truth. No module hardcodes a date.
 
-| Name | Split | Start | End |
+| Window | Role | Split | Dates |
 |---|---|---|---|
-| `train_w1` | train | 2020-05-06 | 2020-05-19 |
-| `train_w2` | train | 2020-05-20 | 2020-06-02 |
-| `train_w3` | train | 2020-06-03 | 2020-06-16 |
-| `train_w4` | train | 2020-06-17 | 2020-06-30 |
-| `train_w5` | train | 2020-07-01 | 2020-07-14 |
-| `train_w6` | train | 2020-07-15 | 2020-07-28 |
-| `train_w7` | train | 2020-07-29 | 2020-08-11 |
-| `train_w8` | train | 2020-08-12 | 2020-08-25 |
-| `val` | val | 2020-08-26 | 2020-09-08 |
-| `test` | test | 2020-09-09 | 2020-09-22 |
-
-Contiguous, non-overlapping, ending on the dataset's last day. Feature history for every
-window reaches back to 2018-09-20 and is always truncated at `W.start`.
+| `ret_w1` … `ret_w4` | `retriever` | train | 2020-05-06 → 2020-06-30 |
+| `rank_w1` … `rank_w4` | `ranker` | train | 2020-07-01 → 2020-08-25 |
+| `val` | `val` | val | 2020-08-26 → 2020-09-08 |
+| `test` | `test` | test | 2020-09-09 → 2020-09-22 |
 
 ```python
 # splits/temporal.py
+
+Split = Literal["train", "val", "test"]
+Role  = Literal["retriever", "ranker", "val", "test"]
+
 @dataclass(frozen=True)
 class Window:
     name: str
-    split: Literal["train", "val", "test"]
-    start: date              # inclusive
-    end: date                # inclusive
+    split: Split
+    role: Role
+    start: date          # inclusive
+    end: date            # inclusive
 
     @property
     def as_of(self) -> date:
-        """Exclusive feature cutoff. Features may read t_dat < as_of, never >=."""
+        """Exclusive feature cutoff. Features may read `t_dat < as_of`, never `>=`.
+
+        This is `start`, not `start - 1 day`: a transaction landing exactly on the first
+        day of the window belongs to the label period, so it must not be visible to a
+        feature. The strict `<` in `features.base.history` is what enforces that.
+        """
         return self.start
 
-def load_windows(cfg: SplitConfig) -> list[Window]: ...
-def assert_contiguous_non_overlapping(ws: Sequence[Window]) -> None: ...
+def load_windows(cfg: SplitConfig | None = None) -> list[Window]: ...
+def windows_for_role(role: Role, cfg: SplitConfig | None = None) -> list[Window]: ...
+def candidate_windows(cfg: SplitConfig | None = None) -> list[Window]:
+    """Every window the frozen retriever generates candidates for: ranker + val + test."""
 ```
 
-`conf/split.yaml` is the single source of truth for these dates. No module hardcodes them.
+Two validators run on every load, both raising rather than warning:
+
+- `assert_contiguous_non_overlapping` — each window starts the day after the previous ends. A
+  gap silently drops transactions from every candidate set; an overlap lets the same purchase be
+  a label in one window and history in another.
+- `assert_role_ordering` — **every `retriever` window ends strictly before the first
+  `ranker` window starts**, and `ranker` < `val` < `test`. This is the new leakage boundary
+  (`prd.md` §5); §15 asserts it independently.
 
 ### 3.2 Cohort
 
-```
-cohort = sample(
-    customers with >= 1 transaction in [2020-03-24, 2020-09-22],
-    n = cohort.size,
-    seed = cohort.seed,
-)
+Drawn once from customers with ≥1 transaction in the qualifying range, persisted, and reused by
+every window and every arm.
+
+```yaml
+cohort:
+  size: 150_000
+  seed: 17
+  qualify_start: 2020-03-24
+  qualify_end: 2020-09-22
 ```
 
-Drawn **once**, persisted, and reused by every window and every arm.
+Sampling per arm would make a ΔNDCG of 0.005 indistinguishable from a different random draw.
 
 ### 3.3 Row-set construction
 
@@ -139,136 +144,154 @@ For each window *W*:
 ```
 eligible  = cohort ∩ {customers with >= 1 purchase in W}
 positives = distinct (customer_idx, article_id) purchased in W by eligible customers
-negatives = sample_negatives(positives, ratio=10, ...)        # §7
-rows_W    = positives ∪ negatives
 ```
 
 Multiple purchases of the same article by the same customer in *W* collapse to **one row**.
 Purchase count is deliberately **not** carried as a feature — it is a function of the label
 window and would leak.
 
-> **Selection effect, stated rather than buried.** Rows exist only for customers who
-> transacted during *W*. The model is therefore evaluated **conditional on the customer
-> transacting**. This is standard for this task and is what keeps per-customer ranking
-> metrics well defined — a customer with zero positives has no meaningful `precision@k`.
-> But it means the reported numbers do not describe performance on the full customer base,
-> and `reports/results.md` must say so.
+The `retriever` windows use `positives` directly as training pairs. The `ranker`, `val`, and
+`test` windows get their rows from §8 candidate generation instead.
+
+> **Selection effect, stated rather than buried.** Rows exist only for customers who transacted
+> during *W*. Every model is therefore evaluated **conditional on the customer transacting**.
+> This is standard for the task and is what keeps per-customer ranking metrics well defined — a
+> customer with zero positives has no meaningful `recall@K`. But the reported numbers do not
+> describe performance over the full customer base, and `reports/results.md` must say so.
 
 ### 3.4 Scale, and the row budget
 
-Estimates below are approximate and will be replaced by measured counts at M2.
+Estimates below are approximate and are replaced by measured counts at M2/M5.
 
 | Quantity | Estimate |
 |---|---|
 | Transactions per 14-day window (all customers) | ~610k |
-| Cohort share of transactions | ~cohort.size / 1.37M |
 | Positives per window, cohort of 150k | ~65k |
-| Train positives, 8 windows | ~520k |
-| Train rows at 1:10 | **~5.7M** |
+| Eligible customers per window | ~16k |
+| **Retriever training pairs** (4 windows of positives) | **~260k** |
+| **Ranker training rows** (4 windows × 16k customers × K=100) | **~6.4M** |
 
-Because these estimates carry real uncertainty, **the binding constraint is a row budget,
-not a cohort size**:
+The ranker estimate **exceeds** the 5M target, so one of cohort size or `K` must give. Rather
+than guess, the constraint is enforced by measurement:
 
 ```yaml
-cohort:
-  size: 150_000          # initial guess
+candidates:
+  k: 100                          # candidate depth for the main grid
+  k_sweep: [20, 50, 100, 200, 500, 1000]
   target_train_rows: 5_000_000
-  seed: 17
+  row_budget_tolerance: 0.2
+  train_customer_cap: null        # set once at M5 from measured counts
 ```
 
-`contentsignal sample` reports actual row counts and **fails if train rows exceed
-`target_train_rows` × 1.2**, with the message naming the cohort size that would fit. The
-cohort size is then adjusted once, before any model is trained. This avoids discovering the
-memory ceiling halfway through M6.
+`retrieve` reports actual row counts and **fails if ranker training rows exceed
+`target_train_rows × 1.2`**, with a message naming the `train_customer_cap` that would fit.
+
+> **Only the *training* windows are capped.** `val` and `test` retrieve for every eligible
+> customer, uncapped, so evaluation is never conditioned on a budget decision. Capping
+> evaluation would silently narrow the customer-level bootstrap and change the confidence
+> intervals the hypotheses are judged on.
+
+The cap is drawn under `cohort.seed` and persisted, so it is identical across every ranker arm.
+
+**Stage 1 is never capped** — it trains on ~260k pairs regardless of `K`, which is why the
+retrieval side of H1 is cheap to explore.
 
 ---
 
 ## 4. Storage contracts
 
-Root: `artifacts/` (gitignored). All Parquet is zstd-compressed.
+Root: `artifacts/` (gitignored). All Parquet is zstd-compressed. Every stage writes a
+`_stamp` file containing `config_sha256` of the config it ran under, which is what makes the
+CLI idempotent (§13).
 
 ### 4.1 `artifacts/parquet/transactions.parquet`
 
-Partitioned by `year_month` for predicate pushdown on `as_of` filters.
+| Column | Type |
+|---|---|
+| `customer_idx` | `int32` (dense, from §4.4) |
+| `article_id` | `int32` |
+| `t_dat` | `date32` |
+| `price` | `float32` |
+| `sales_channel_id` | `int8` |
 
-| Column | Type | Note |
-|---|---|---|
-| `t_dat` | `date32` | |
-| `customer_idx` | `int32` | dense index; see 4.4 |
-| `article_id` | `int32` | |
-| `price` | `float32` | scaled units, **not currency** (PRD §2) |
-| `sales_channel_id` | `int8` | 1 in-store, 2 online |
-
-~31.8M rows, ~350 MB on disk.
+Sorted by `t_dat`, then `customer_idx`. Row-group size 256 MB.
 
 ### 4.2 `artifacts/parquet/articles.parquet`
 
-All original columns, with `*_name` fields as `categorical` and `detail_desc` as `utf8`
-(nullable). Plus two derived columns:
-
-| Column | Type | Note |
-|---|---|---|
-| `text_a` | `utf8` | Full concat, PRD §6 Text-A |
-| `text_b` | `utf8` | `detail_desc` only, PRD §6 Text-B. Null → empty string, with `text_b_is_null` flag |
-
-~105k rows, ~20 MB.
+`article_id` `int32`, the 11 taxonomy columns as `categorical`, `product_code` `int32`,
+`prod_name` and `detail_desc` as `str`. Null `detail_desc` becomes the empty string, and the
+count of nulls is reported in the EDA — an empty description is a legitimate input to the
+encoder, but silently dropping those articles would bias the cold-start slice.
 
 ### 4.3 `artifacts/parquet/customers.parquet`
 
-Original columns; `age` nullable `float32` with a companion `age_is_null` boolean;
-`postal_code` hashed to `int32`. ~1.37M rows, ~25 MB.
+`customer_idx` `int32`, `age` `float32` (null preserved), `FN` / `Active` `int8`,
+`club_member_status` and `fashion_news_frequency` `categorical`.
 
 ### 4.4 `artifacts/parquet/customer_index.parquet`
 
-`customer_id` (`utf8`, the original 64-char hex) → `customer_idx` (`int32`). Persisted
-because the hex IDs cost ~90 MB in memory and the mapping must be stable across runs.
+`customer_id` (hex `str`) → `customer_idx` `int32`. Written once, never regenerated: every
+downstream artifact keys on `customer_idx`, so a re-hash would invalidate all of them.
 
-### 4.5 `artifacts/rows/{window}.parquet`
+### 4.5 `artifacts/candidates/{window}.parquet` + `candidates_manifest.json`
 
-The materialized labelled row sets — **written once, then immutable**.
+**The byte-identity invariant of the whole stage-2 experiment.**
 
-| Column | Type |
-|---|---|
-| `customer_idx` | `int32` |
-| `article_id` | `int32` |
-| `y` | `int8` |
-| `window` | `categorical` |
+| Column | Type | Notes |
+|---|---|---|
+| `customer_idx` | `int32` | |
+| `article_id` | `int32` | |
+| `retrieval_score` | `float32` | raw dot product from the frozen retriever |
+| `retrieval_rank` | `int16` | 1 = top of this customer's list |
+| `y` | `int8` | 1 if purchased in this window |
 
-A `rows_manifest.json` alongside records the sampler seed, ratio, per-window counts, and a
-SHA-256 of each file. **Arms 1–8 assert this digest before training.** This is what makes
-"identical rows" (PRD §5) enforceable rather than aspirational.
+Sorted by `customer_idx`, then `retrieval_rank`. The manifest records, per window:
 
-> **Arms 9/10 are the bounded exception.** They train with in-batch sampled softmax over
-> positives only, so they never read these files for training — but they **assert the same
-> digest before evaluation**, since they are scored on the identical test rows (§9b.4).
+```json
+{
+  "ret_retriever": "R2", "ret_seed": 1, "ret_config_sha256": "…",
+  "k": 100, "window": "rank_w1",
+  "rows": 1600123, "customers": 16001, "positives": 64998,
+  "recall_at_k": 0.412,
+  "sha256": "…"
+}
+```
+
+`sha256` is over the Parquet bytes. **Every ranker asserts it before fitting** (§5.5). Writing
+is a single atomic rename; a partial file must never be digestible.
 
 ### 4.6 `artifacts/features/{group}/{window}.parquet`
 
-One file per feature group per window, keyed by `customer_idx` and/or `article_id`, joined
-at train time. Groups: `customer`, `article`, `categorical`, `cross`, `text_item`,
-`text_customer`.
+One file per (group, window). Key columns `customer_idx` and/or `article_id` plus the group's
+declared columns, exactly as declared on the builder (§5.1). Column drift is an error, not a
+surprise.
 
-### 4.7 Embedding artifacts
+### 4.7 Item vector cache — `artifacts/vectors/{retriever}_{seed}/`
 
-Deliberately **not** Parquet, so the serving benchmark (§12) can `mmap` them:
+| File | Contents |
+|---|---|
+| `item.npy` | `float32[n_articles, 128]`, L2-normalized, row *i* ↔ `ids.npy[i]` |
+| `ids.npy` | `int32[n_articles]`, **sorted ascending** |
+| `_stamp` | `config_sha256` of the retriever config |
 
-```
-artifacts/emb/{variant}_{source}/vectors.npy   float32 [n_articles, 384]  (C-contiguous)
-artifacts/emb/{variant}_{source}/ids.npy       int32   [n_articles]       (sorted ascending)
-artifacts/emb/{variant}_{source}/svd32.npy     float32 [n_articles, 32]
-artifacts/emb/{variant}_{source}/svd.joblib    fitted TruncatedSVD (fit on TRAIN articles only)
-```
+> **`.npy` plus a sorted id array, not Parquet.** The serving benchmark must `mmap` the matrix
+> and look up by binary search (`np.searchsorted`) without deserializing or copying. Parquet
+> cannot be mmap'd as a contiguous float matrix, which would put a decode step inside the
+> latency measurement and make §12 measure the wrong thing.
 
-`variant ∈ {a, b}` (PRD §6 text variants), `source ∈ {frozen, contrastive}`.
+`105,000 × 128 × 4 B ≈ 54 MB.`
 
-> **Leakage note.** The SVD is fitted on articles appearing in **train windows only**, then
-> applied to all articles. Fitting on the full catalog would let test-window articles
-> influence the projection basis.
+### 4.8 `artifacts/rows_random/{window}.parquet`
 
-### 4.8 `artifacts/taste/{window}.npz`
+The H3 arm only: positives plus `sampler.ratio` popularity-weighted random negatives per
+positive, on the same `ranker` windows. Schema as §4.5, without `retrieval_score` and
+`retrieval_rank` — a randomly drawn negative was never retrieved, so it has no rank to report.
 
-`customer_idx` (`int32[n]`) and `taste` (`float32[n, 384]`) for eligible customers in that
-window. ~80k × 384 × 4 ≈ 123 MB per window; written per window and loaded one at a time.
+> **The H3 pair must differ in exactly one thing.** Because random-negative rows have no
+> retrieval columns, the **retrieved-negative arm in the H3 comparison also has them withheld**.
+> Otherwise the delta would bundle "hard negatives" together with "three extra features," and
+> H3's registered claim is about the negative distribution alone. The main grid (§9b) keeps the
+> retrieval columns; only the H3 pair drops them, and `reports/results.md` says so on the row.
 
 ---
 
@@ -276,121 +299,177 @@ window. ~80k × 384 × 4 ≈ 123 MB per window; written per window and loaded on
 
 ### 5.1 The `as_of` contract — the load-bearing interface
 
+Unchanged from the current implementation, and now guarding more surface than before.
+
 ```python
 # features/base.py
 
 def history(txns: pl.LazyFrame, *, as_of: date) -> pl.LazyFrame:
     """The ONLY sanctioned way to read transactions inside a feature builder.
 
-    Returns strictly-before-cutoff rows. Every builder calls this first; no builder
-    touches the raw LazyFrame. Enforced by review and by test_leakage.py.
+    Strictly-before-cutoff rows. The comparison is strict `<`: a transaction dated
+    exactly `as_of` falls on the first day of the label window, so admitting it would
+    leak a day of the thing being predicted.
     """
     return txns.filter(pl.col("t_dat") < as_of)
 
-
+@runtime_checkable
 class FeatureBuilder(Protocol):
     name: str                       # -> artifacts/features/{name}/
     columns: tuple[str, ...]        # declared output columns, asserted on build
 
-    def build(
-        self,
-        txns: pl.LazyFrame,
-        *,
-        as_of: date,
-        entities: pl.DataFrame,     # the keys to produce rows for
-    ) -> pl.DataFrame: ...
+    def build(self, txns: pl.LazyFrame, *, as_of: date,
+              entities: pl.DataFrame) -> pl.DataFrame: ...
+
+ALL_BUILDERS: list[FeatureBuilder] = []
+
+def register_builder(builder: B) -> B: ...       # checks the contract at import time
+def assert_as_of_is_enforced(builder: object) -> None: ...
+def assert_declared_columns(builder: FeatureBuilder, out: pl.DataFrame) -> None: ...
 ```
 
-`as_of` is **keyword-only and required**. There is no default and no overload without it —
-the signature itself makes the leak unwritable rather than merely discouraged.
+`as_of` is **keyword-only and has no default**. `register_builder` verifies both at import time,
+so a violation fails in the pipeline and not only under pytest. `ALL_BUILDERS` exists so a
+builder added later is automatically subjected to the deletion-invariance property (§15) —
+nobody has to remember to wire it up.
+
+> **Never add an overload or a default that permits reading without a cutoff.** The signature is
+> the enforcement mechanism. A comment is not.
 
 ### 5.2 Splits — `splits/temporal.py`
 
-As in §3.1, plus:
+As §3.1, plus the row-set helpers already implemented:
 
 ```python
 def eligible_customers(txns: pl.LazyFrame, w: Window, cohort: pl.Series) -> pl.Series: ...
 def positives(txns: pl.LazyFrame, w: Window, eligible: pl.Series) -> pl.DataFrame: ...
 ```
 
-### 5.3 Sampling — `sampling/negatives.py`
+### 5.3 Retriever — `models/twotower.py`
 
 ```python
-@dataclass(frozen=True)
-class SamplerConfig:
-    ratio: int = 10
-    pop_exponent: float = 0.75
-    pop_lookback_weeks: int = 12
-    seed: int = 17
+class ItemTower(nn.Module):
+    """taxonomy embeddings ⊕ numerics ⊕ (optional) text → MLP → 128, L2-normed.
 
-def candidate_pool(txns: pl.LazyFrame, *, as_of: date, cfg: SamplerConfig) -> pl.DataFrame:
-    """article_id + sampling weight. Only articles with >=1 prior transaction."""
+    No article-ID embedding: a newly added article's ID vector would be untrained
+    noise, and cold-start capability is the mechanism H2 tests (prd.md §6).
+    """
+    def __init__(self, *, encoder: SentenceTransformer | None,
+                 cat_cardinalities: dict[str, int], n_numeric: int,
+                 out_dim: int = 128): ...
+    def forward(self, cats, nums, text_ids=None, text_mask=None) -> Tensor: ...  # [B, 128]
 
-def sample_negatives(
-    positives: pl.DataFrame,        # customer_idx, article_id
-    *,
-    pool: pl.DataFrame,             # article_id, weight
-    cfg: SamplerConfig,
-    window_name: str,
-) -> pl.DataFrame: ...              # customer_idx, article_id, y=0
+class CustomerTower(nn.Module):
+    """history (attention-pooled item IDs) ⊕ categorical ⊕ numerics → MLP → 128, L2-normed."""
+    def __init__(self, *, n_items: int, id_dim: int = 64, hist_len: int = 20,
+                 cat_cardinalities: dict[str, int], n_numeric: int,
+                 out_dim: int = 128): ...
+    def forward(self, hist_ids, hist_mask, cats, nums) -> Tensor: ...            # [B, 128]
+
+class TwoTower(nn.Module):
+    def score(self, cust_vec: Tensor, item_vec: Tensor) -> Tensor:
+        return (cust_vec * item_vec).sum(-1) / self.temperature
 ```
 
-### 5.4 Text — `features/text.py`
+| Component | Spec |
+|---|---|
+| History length | last 20 purchases, right-padded, masked |
+| History pooling | **self-attentive with a learned query**: `softmax(qᵀ tanh(W·h)) · h` |
+| Customer item-ID table | 105k × 64 (~27 MB) — history only |
+| Tower MLPs | [512, 256] → 128, GELU, dropout 0.1, L2-normalized output |
+| Categorical embeddings | 8–16 d per field |
+| Temperature | learned scalar, init 0.05 |
+| Encoder | `all-MiniLM-L6-v2`, 64 tokens max, trained jointly at 2e-5 |
+
+> **Self-attentive, never candidate-aware.** Candidate-conditioned attention would score better,
+> but the customer vector would then depend on the item and neither tower could be precomputed.
+> That breaks retrieval outright and voids §12. **Enforced by the signature:**
+> `CustomerTower.forward` takes no item argument. Asserted in
+> `tests/test_retrieval.py::test_customer_tower_is_item_independent`.
+
+### 5.4 Retrieval — `retrieval/index.py`, `retrieval/candidates.py`
 
 ```python
-def build_article_text(articles: pl.DataFrame, variant: Literal["a", "b"]) -> pl.DataFrame: ...
+# retrieval/index.py
 
-def encode_articles(
-    texts: pl.DataFrame, *, model: SentenceTransformer,
-    batch_size: int = 256, device: str = "mps",
-) -> np.ndarray: ...                                        # [n, 384] float32
+class ItemIndex:
+    """Memory-mapped item vectors + exact top-K. FAISS is a §12 comparison, not a dependency."""
+    @classmethod
+    def open(cls, path: Path) -> ItemIndex: ...          # mmap item.npy, load ids.npy
+    @property
+    def nbytes(self) -> int: ...                          # reported by bench, so the claim is measured
 
-def taste_vectors(
-    txns: pl.LazyFrame, *, as_of: date, cache: EmbeddingCache,
-    customers: np.ndarray, recent_k: int = 10,
-) -> TasteVectors: ...
+    def topk(self, cust_vecs: np.ndarray, *, k: int,
+             allowed: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Exact top-k by dense matvec. Returns (article_ids[B, k], scores[B, k]).
 
-def similarity_features(
-    taste: TasteVectors, cache: EmbeddingCache, rows: pl.DataFrame,
-) -> pl.DataFrame: ...              # sim_taste_cos, sim_last10_max/mean, sim_taste_pct_rank
+        `allowed` is a boolean mask over `ids`, and it is how the no-future-catalog
+        guard is implemented: articles with zero transactions before `W.start` are
+        masked to -inf, never merely deprioritized. An unreleased article is trivially
+        separable and its presence would inflate every metric downstream.
+        """
 ```
 
-`TasteVectors` holds the mean vector, the last-*k* matrix, and a customer index, all
-L2-normalized at construction so similarity is a single matmul.
+```python
+# retrieval/candidates.py
 
-### 5.5 Arms — `models/base.py`
+def generate(w: Window, *, index: ItemIndex, tower: CustomerTower,
+             customers: pl.Series, txns: pl.LazyFrame, k: int) -> pl.DataFrame:
+    """Top-k candidates for one window, labeled against that window's positives.
 
-A common protocol so arms are interchangeable and the training CLI is arm-agnostic:
+    Customer vectors are built from history strictly before `w.as_of` — the model is
+    frozen, but its inputs are recomputed per window, which is exactly how a deployed
+    retriever behaves between retrainings.
+    """
+
+def write_candidates(w: Window, df: pl.DataFrame, *, meta: dict) -> str:
+    """Atomic write + manifest entry. Returns the sha256 of the Parquet bytes."""
+
+def assert_digest(w: Window, *, manifest: Path) -> None:
+    """Raise unless the on-disk candidate file matches its recorded digest.
+
+    Called by every ranker before fitting. A ΔNDCG of 0.005 must not be attributable
+    to one arm having received a different candidate list.
+    """
+```
+
+### 5.5 Rankers — `models/base.py`
+
+The existing `Arm` protocol is unchanged; three rankers implement it.
 
 ```python
+@runtime_checkable
 class Arm(Protocol):
     name: str
     feature_groups: tuple[str, ...]
 
     def fit(self, X: pl.DataFrame, y: np.ndarray, *,
             valid: tuple[pl.DataFrame, np.ndarray] | None) -> None: ...
-    def predict(self, X: pl.DataFrame) -> np.ndarray: ...   # SAMPLED-distribution probs
+    def predict(self, X: pl.DataFrame) -> np.ndarray:
+        """UNCALIBRATED scores. Calibration never happens inside an arm."""
     def save(self, path: Path) -> None: ...
     @classmethod
-    def load(cls, path: Path) -> "Arm": ...
+    def load(cls, path: Path) -> Arm: ...
 ```
 
-`predict` returns probabilities on the **sampled** distribution. Prior correction (§10.3) is
-applied by the evaluator, never inside an arm — so the correction is applied exactly once
-and identically everywhere.
+> **Calibration is applied by the evaluator, in one place, identically for every arm** (§10.7).
+> An arm that calibrated its own output would make cross-arm probability metrics
+> incomparable in a way nothing would catch.
 
 ### 5.6 Serving — `serving/embedding_cache.py`
 
 ```python
 class EmbeddingCache:
-    def __init__(self, dir: Path, *, mmap: bool = True) -> None: ...
-    def take(self, article_ids: np.ndarray) -> np.ndarray: ...   # vectorized gather
-    def __getitem__(self, article_id: int) -> np.ndarray: ...
+    """mmap'd float32 matrix + sorted int32 ids; lookup by np.searchsorted."""
+    @classmethod
+    def open(cls, path: Path) -> EmbeddingCache: ...
+    def get(self, article_ids: np.ndarray) -> np.ndarray: ...     # [n, dim], no copy where possible
     @property
     def nbytes(self) -> int: ...
 ```
 
-Lookup is `np.searchsorted` on the sorted `ids.npy` — O(log n), no dict, mmap-friendly.
+Raises on an unknown `article_id` rather than returning zeros. A zero vector is a valid-looking
+input that would silently degrade exactly the cold-start slice H2 is measured on.
 
 ---
 
@@ -402,7 +481,7 @@ Lookup is `np.searchsorted` on the sorted `ids.npy` — O(log n), no dict, mmap-
 
 | Column | Type | `as_of` | Definition |
 |---|---|---|---|
-| `cust_age` | `float32` | — | null → NaN, LightGBM handles natively |
+| `cust_age` | `float32` | — | null → NaN; LightGBM handles natively, MLP/DCN get the null flag |
 | `cust_age_is_null` | `int8` | — | |
 | `cust_club_status` | `cat` | — | |
 | `cust_news_freq` | `cat` | — | |
@@ -413,6 +492,8 @@ Lookup is `np.searchsorted` on the sorted `ids.npy` — O(log n), no dict, mmap-
 | `cust_price_{mean,median,std}` | `float32` | Y | over trailing 12w |
 | `cust_online_share` | `float32` | Y | `sales_channel_id == 2` share, 12w |
 | `cust_days_since_last` | `int32` | Y | |
+
+**18 columns.** The same block feeds the customer tower's non-sequence inputs (§5.3).
 
 ### 6.2 Article (`features/article.py`, group `article`)
 
@@ -425,16 +506,22 @@ Lookup is `np.searchsorted` on the sorted `ids.npy` — O(log n), no dict, mmap-
 | `art_days_since_first_sale` | `int32` | Y | |
 | `art_days_since_last_sale` | `int32` | Y | |
 | `art_online_share` | `float32` | Y | |
+| `art_prior_purchases` | `int32` | Y | total purchases before `as_of` — **the cold-start slicing key** |
+| `art_is_cold` | `int8` | Y | `art_prior_purchases < eval.cold_start_threshold` (default 10) |
+
+**9 columns.** Also feeds the item tower's numerics.
 
 ### 6.3 Categorical (`features/categorical.py`, group `categorical`)
 
-Eleven columns as native LightGBM categoricals: `product_type_name`, `product_group_name`,
-`colour_group_name`, `department_no`, `index_name`, `index_group_name`, `section_name`,
-`garment_group_name`, `graphical_appearance_name`, `perceived_colour_value_name`,
-`perceived_colour_master_name`.
+Eleven columns, native LightGBM categoricals and embedding-table inputs for MLP/DCN:
+`product_type_name`, `product_group_name`, `colour_group_name`, `department_no`, `index_name`,
+`index_group_name`, `section_name`, `garment_group_name`, `graphical_appearance_name`,
+`perceived_colour_value_name`, `perceived_colour_master_name`.
 
-> **PRD §6 non-negotiable: the tabular baseline (arm 3) receives all eleven.** Withholding
-> them would credit the encoder with information the baseline was never given.
+> **PRD §3 non-negotiable: every ranker arm and both retriever arms receive all eleven.**
+> Withholding them from a baseline while feeding the same information to an encoder as text
+> would credit the encoder with information the baseline was never given. This is the single
+> most common way this class of experiment is run wrong.
 
 ### 6.4 Cross (`features/cross.py`, group `cross`)
 
@@ -443,264 +530,104 @@ Eleven columns as native LightGBM categoricals: `product_type_name`, `product_gr
 | `x_prior_in_product_group` | `int32` | Y | customer's prior purchases in this article's group |
 | `x_prior_in_department` | `int32` | Y | |
 | `x_prior_in_colour_group` | `int32` | Y | |
-| `x_bought_product_code_before` | `int8` | Y | same garment, any colourway/size |
+| `x_bought_product_code_before` | `int8` | Y | same garment, any colourway or size |
 | `x_price_vs_cust_mean` | `float32` | Y | `art_price_mean` − `cust_price_mean` |
-| `x_age_indexgroup_affinity` | `float32` | Y | empirical rate for the customer's age bucket × `index_group`, computed on history only |
+| `x_age_indexgroup_affinity` | `float32` | Y | empirical rate for the customer's age bucket × `index_group`, history only |
 
-### 6.5 Text — item side (group `text_item`)
+**6 columns.** These are the hand-built feature crosses that DCN-v2 is measured against (§9b).
 
-| Column | Type | Definition |
-|---|---|---|
-| `art_emb_{0..31}` | `float32` | SVD-32 of the 384-dim article embedding (§4.7) |
-
-### 6.6 Text — customer side (group `text_customer`)
+### 6.5 Retrieval (`features/retrieval.py`, group `retrieval`) — new
 
 | Column | Type | `as_of` | Definition |
 |---|---|---|---|
-| `sim_taste_cos` | `float32` | Y | cosine(taste vector, article embedding) |
-| `sim_last10_max` | `float32` | Y | max cosine to the 10 most recent purchases |
-| `sim_last10_mean` | `float32` | Y | mean of the same |
-| `sim_taste_pct_rank` | `float32` | Y | percentile of `sim_taste_cos` within this customer's candidate set |
-| `cust_taste_{0..31}` | `float32` | Y | **optional, off by default** — see below |
+| `retrieval_score` | `float32` | Y | raw dot product from the frozen retriever |
+| `retrieval_rank` | `int16` | Y | 1 = top of this customer's candidate list |
+| `retrieval_log_rank` | `float32` | Y | `log1p(retrieval_rank)` — rank is heavy-tailed, and axis-aligned tree splits handle the log far better |
 
-> **Why the raw taste dimensions default off.** Trees cannot compute a dot product; giving
-> them 32 taste dimensions and 32 article dimensions and hoping for an interaction is
-> exactly the weakness that motivated this feature group. `sim_taste_cos` *is* that dot
-> product, pre-computed. The raw dimensions are retained behind
-> `features.text_customer.include_raw_dims` as an ablation, and enabling them costs ~640 MB
-> at 5M rows (§14). The four scalars are mandatory; the 32 dimensions are a nice-to-have.
+Built through the standard `FeatureBuilder` ABC despite reading from the candidate file rather
+than aggregating transactions, so it inherits the `as_of` signature check and the
+deletion-invariance property automatically.
 
-### 6.7 Cold start (group `article`, used for slicing)
-
-| Column | Type | `as_of` | Definition |
-|---|---|---|---|
-| `art_prior_purchases` | `int32` | Y | total purchases before `as_of` |
-| `art_is_cold` | `int8` | Y | `art_prior_purchases < eval.cold_start_threshold` (default 10) |
-
-Present as features and as the slicing key for §10.4.
-
-**Column totals**: 18 customer + 9 article/cold + 11 categorical + 6 cross + 32 item-text
-+ 4 customer-text = **80 columns** default; 112 with raw taste dimensions enabled.
+**Column total: 18 customer + 9 article + 11 categorical + 6 cross + 3 retrieval = 47.**
 
 ---
 
-## 7. Negative sampling
+## 7. What was removed, and why nothing was lost
 
-```
-function sample_negatives(positives, pool, cfg, W):
-    # pool: articles with >=1 transaction before W.start, weight = pop_12w ** 0.75
-    alias = AliasTable(pool.article_id, pool.weight, seed=cfg.seed ^ hash(W.name))
+The previous design had two additional feature groups. Both are gone, along with the SVD step
+and `artifacts/taste/`.
 
-    out = []
-    for (c, seen) in positives.group_by(customer_idx):
-        need   = cfg.ratio * len(seen)
-        drawn  = set()
-        guard  = 0
-        while len(drawn) < need:
-            batch = alias.draw(need - len(drawn) + 8)        # slack for rejections
-            for a in batch:
-                if a not in seen and a not in drawn:
-                    drawn.add(a)
-                    if len(drawn) == need: break
-            guard += 1
-            assert guard < 64, f"pathological rejection rate for customer {c}"
-        out += [(c, a, 0) for a in drawn]
-    return out
-```
-
-Notes:
-
-- **Alias method**, O(1) per draw. The pool is ~40–60k articles; building the table per
-  window is negligible.
-- **Rejection is rare by construction**: `|seen|` is typically 2–5 against a pool of tens of
-  thousands, so the expected rejection rate is well under 1%. The `guard` exists to convert
-  a pathological case into a loud failure rather than a hang.
-- **`drawn` is a set**, so a customer never receives the same negative twice — duplicate
-  negatives would silently reweight the loss.
-- **Seed is per-window** (`cfg.seed ^ hash(W.name)`) so windows are independent but the
-  whole set is reproducible from one root seed.
-- Output is written to `artifacts/rows/{window}.parquet` **once** and digested (§4.5).
-
-**Uniform-sampling sensitivity check** (PRD §5): the same function with
-`pop_exponent = 0.0`, written to `artifacts/rows_uniform/`, run for arms 3 and 7b only,
-reported in an appendix.
-
----
-
-## 8. Contrastive fine-tuning
-
-### 8.1 Pair construction
-
-```
-pairs = []
-for c in cohort:
-    hist = purchases by c in [val_start - 12w, val_start)      # STRICTLY before val
-    arts = distinct(hist.article_id)
-    if len(arts) < 2: continue
-    for (a1, a2) in sample_without_replacement(combinations(arts, 2), k <= 5):
-        pairs.append((text[a1], text[a2]))
-
-pairs = enforce_article_cap(pairs, max_per_article=50)
-pairs = subsample(pairs, n=300_000, seed=cfg.seed)
-```
-
-| Parameter | Value | Rationale |
+| Removed | Was | Why it is unnecessary now |
 |---|---|---|
-| Lookback | 12 weeks before `val_start` (2020-08-26) | Recent co-purchase, and strictly outside val/test |
-| Max pairs per customer | **5** | Heavy buyers would otherwise dominate |
-| Max pairs per article | **50** | Bestsellers would otherwise dominate, pushing the encoder back toward a popularity proxy — the exact failure this objective exists to avoid |
-| Target pairs | 300k | Fits the runtime budget at 1–2 epochs |
+| `text_item` | 32 SVD dimensions of the article embedding | The ranker no longer consumes article embeddings; stage 1 does, natively at 128 d |
+| `text_customer` | `cust_taste_{0..31}`, `sim_taste_cos`, `sim_last10_{max,mean}`, `sim_taste_pct_rank` | **Trees cannot compute a dot product.** Given 32 taste dimensions and 32 article dimensions, a tree has no way to multiply them, so the similarity had to be precomputed by hand. A two-tower's score *is* that dot product, learned end-to-end. Hand-building it downstream would duplicate stage 1's job, less well |
 
-### 8.2 Training
+Consequences worth stating explicitly:
 
-| Setting | Value |
-|---|---|
-| Base model | `sentence-transformers/all-MiniLM-L6-v2` |
-| Loss | `MultipleNegativesRankingLoss` (InfoNCE, in-batch negatives), scale 20 |
-| Batch | 64 pairs = 128 sequences |
-| `max_seq_length` | 64 tokens |
-| Optimizer | AdamW, lr 2e-5, 10% linear warmup |
-| Epochs | 1–2, selected on val (§8.4) |
-| Device | `mps`, with `--device cpu` fallback |
-| Seeds | 3 |
-
-Run separately for Text-A and Text-B, producing four embedding artifacts total with the two
-frozen baselines.
-
-> **The efficiency property (PRD §7).** Each training example is a *pair of article texts*,
-> not a (customer, article) row. With ~105k unique articles and per-article capping, each
-> string is encoded a bounded number of times per epoch instead of ~38×. At 300k pairs /
-> batch 64 ≈ 4,700 steps/epoch, this is **~6–10 min/epoch on MPS**.
-
-### 8.3 Mandatory diagnostics
-
-Reported whatever they show; suppressing them would defeat the point.
-
-1. **Popularity correlation.** Spearman ρ between the text-only arm's (arm 8) predictions
-   and `log(art_pop_12w + 1)` on the test window. High ρ means the text signal is largely a
-   popularity restatement. Logged to MLflow as `diag/spearman_pop`.
-2. **Nearest neighbors.** For 20 fixed articles (sampled across `index_group`), the top-10
-   cosine neighbors before and after fine-tuning, dumped to
-   `reports/figures/nn_{variant}_{source}.md`. The cheapest possible check that the space
-   learned something fashion-shaped rather than collapsing.
-3. **Embedding collapse check.** Mean pairwise cosine and the rank of the embedding matrix.
-   Contrastive training with in-batch negatives can collapse; a mean cosine above ~0.9 or a
-   sharp rank drop fails the run.
-
-### 8.4 Leakage guards
-
-- All pairs drawn strictly from `t_dat < 2020-08-26`. Asserted in `tests/test_leakage.py`.
-- Epoch selection uses **val** only; test is untouched until §16 M9.
-- The SVD projection is fitted on train-window articles only (§4.7).
+- Text still reaches the ranker, through `retrieval_score`. The stage-2 axis is therefore *"the
+  ranker's own features"*, not *"a text-free pipeline"*. The clean pipeline-level number is H2's
+  end-to-end comparison. Stated inline in `reports/results.md`.
+- 80 columns → 47 drops the LightGBM design matrix from 1.6 GB raw / 400 MB binned to ~940 MB /
+  ~235 MB (§14).
 
 ---
 
-## 9. Arm grid and run matrix
+## 8. Candidate generation
 
-### 9.1 Arms
+### 8.1 The algorithm
 
-| # | Arm | Feature groups | Embedding source |
-|---|---|---|---|
-| 1 | `popularity` | `art_pop_12w` only | — |
-| 2 | `logreg_tab` | customer, article, categorical (one-hot), cross | — |
-| 3 | **`lgbm_tab`** | customer, article, categorical, cross | — |
-| 4a | `lgbm_frozen_item` | 3 + `text_item` | pretrained |
-| 4b | `lgbm_frozen_pers` | 3 + `text_item` + `text_customer` | pretrained |
-| 7a | `lgbm_ft_item` | 3 + `text_item` | contrastive |
-| 7b | **`lgbm_ft_pers`** | 3 + `text_item` + `text_customer` | contrastive |
-| 8 | `text_only` | `text_item` + `text_customer` | contrastive |
+```
+function generate(W, retriever, index, customers, k):
+    eligible = cohort ∩ {customers with >= 1 purchase in W}      # §3.3
+    if W.role == "ranker" and candidates.train_customer_cap:
+        eligible = sample(eligible, cap, seed=cohort.seed ^ crc32(W.name))
 
-### 9.2 Deltas
+    # No future catalog: mask articles with zero transactions before W.start.
+    allowed  = {a : count(txns, a, t_dat < W.start) >= 1}
 
-| Delta | Isolates |
-|---|---|
-| **7b − 3** | **Headline.** Total lift from product content |
-| 7b − 7a | Personalization (taste vector + similarity features) |
-| 7b − 4b | Fine-tuning. If ≈ 0, a frozen encoder sufficed — changes the §12 cost story |
+    hist     = last 20 article_ids per customer, strictly before W.start
+    cust_vec = retriever.customer_tower(hist, cust_cats, cust_nums)   # frozen weights
+    ids, scores = index.topk(cust_vec, k=k, allowed=allowed)
 
-### 9.3 Run matrix
-
-| Arms | Text variants | Seeds | Runs |
-|---|---|---|---|
-| 1 | — | 1 | 1 |
-| 2, 3 | — | 3 | 6 |
-| 4a, 4b, 7a, 7b | A, B | 3 | 24 |
-| 8 | A, B | 3 | 6 |
-| Sensitivity: SVD 64 and 384 on 7b | B | 3 | 6 |
-| Sensitivity: uniform negatives on 3, 7b | B | 1 | 2 |
-| Sensitivity: raw taste dims on 7b | B | 3 | 3 |
-| | | | **48** |
-
-Plus **13** two-tower runs (§9b.6) → **61 total**.
-
-SVD dim is fixed at **32** for the main grid; 64 and raw-384 appear only in the sensitivity
-rows. This is the single largest lever on total runtime and is deliberately bounded.
-
-### 9.4 LightGBM configuration
-
-```yaml
-# conf/model/lgbm.yaml
-objective: binary
-metric: [auc, binary_logloss]
-learning_rate: 0.05
-num_leaves: 127
-min_data_in_leaf: 200
-feature_fraction: 0.8
-bagging_fraction: 0.8
-bagging_freq: 1
-max_bin: 63              # memory-critical, see §14
-num_threads: 7           # leave one core for the OS
-num_boost_round: 2000
-early_stopping_round: 100    # on val AUC
+    pos      = positives(txns, W, eligible)
+    rows     = flatten(ids, scores) with y = 1 where (customer, article) in pos
+    return rows sorted by (customer_idx, rank)
 ```
 
-Hyperparameters are tuned **on val, for arm 3 only**, then frozen and reused by every
-LightGBM arm. Tuning each arm separately would confound "better features" with "more tuning
-budget" — the delta must be attributable to features alone.
+`crc32` rather than Python's `hash()`: `hash()` is salted per process, so a per-window seed
+derived from it would differ between runs and silently break reproducibility.
+
+### 8.2 Invariants
+
+| Invariant | Enforcement |
+|---|---|
+| Written once, byte-identical across ranker arms | `candidates_manifest.json` sha256, asserted by every arm before fitting |
+| Never regenerated per arm | `retrieve` is idempotent on `config_sha256`; `--force` is the only override and it rewrites the manifest |
+| The retriever is frozen for the whole stage-2 experiment | Retriever checkpoint digest recorded in the manifest; a mismatch is an error |
+| No future catalog | The `allowed` mask in §8.1, asserted in §15 |
+| Row budget respected | `retrieve` measures and fails loudly, naming the cap that fits (§3.4) |
+| `val` / `test` uncapped | Cap applies only where `W.role == "ranker"` |
+
+### 8.3 Random negatives — the H3 arm only
+
+`sampling/negatives.py` is retained unchanged and repurposed. It draws, per positive,
+`sampler.ratio = 10` negatives from an alias table weighted `∝ (pop_12w + 1) ** 0.75` — the
+standard word2vec-style dampening — excluding the customer's true positives in *W* and any
+article with no transactions before `W.start`.
+
+Uniform (unweighted) sampling runs **once** as a sensitivity check in an appendix, not as a
+headline arm: uniform negatives are trivially separable and inflate AUC.
+
+For H3 the comparison pair is the **same ranker architecture** trained on
+`artifacts/rows_random/` versus `artifacts/candidates/`, both with `retrieval_score` /
+`retrieval_rank` / `retrieval_log_rank` withheld, so the only difference is the negative
+distribution. Both are evaluated end-to-end on the identical `test` candidate rows.
 
 ---
 
-## 9b. Two-tower neural ranker (arms 9, 10)
+## 9. Stage 1 — retriever training
 
-### 9b.1 Architecture
-
-```python
-# models/twotower.py
-
-class ItemTower(nn.Module):
-    """text → MiniLM → proj ⊕ categorical embeddings ⊕ numerics → MLP → 128, L2-normed."""
-    def __init__(self, encoder: SentenceTransformer, *, freeze_encoder: bool,
-                 cat_cardinalities: dict[str, int], n_numeric: int, out_dim: int = 128): ...
-    def forward(self, text_ids, text_mask, cats, nums) -> Tensor: ...   # [B, 128]
-
-class CustomerTower(nn.Module):
-    """history (attention-pooled item IDs) ⊕ categorical ⊕ numerics → MLP → 128, L2-normed."""
-    def __init__(self, n_items: int, id_dim: int = 64, hist_len: int = 20,
-                 cat_cardinalities: dict[str, int] = ..., n_numeric: int = ...,
-                 out_dim: int = 128): ...
-    def forward(self, hist_ids, hist_mask, cats, nums) -> Tensor: ...   # [B, 128]
-
-class TwoTower(nn.Module):
-    def score(self, cust_vec, item_vec) -> Tensor:     # temperature-scaled dot product
-        return (cust_vec * item_vec).sum(-1) / self.temperature
-```
-
-| Component | Spec |
-|---|---|
-| Item-ID embedding table | 105k × 64 (~27 MB) |
-| History length | last 20 purchases, right-padded, masked |
-| History pooling | **self-attentive with a learned query vector** — `softmax(qᵀ tanh(W·h)) · h` |
-| Tower MLPs | [512, 256] → 128, GELU, dropout 0.1, L2-normalized output |
-| Categorical embeddings | 8–16 d per field |
-| Temperature | learned scalar, init 0.05 |
-
-> **Self-attentive, never candidate-aware.** A candidate-conditioned attention would score
-> better, but the customer vector would then depend on the item, and neither tower could be
-> precomputed. That breaks retrieval and voids the §12 serving-cost analysis. Enforced by the
-> signature: `CustomerTower.forward` takes **no item argument**. Asserted in
-> `tests/test_twotower.py::test_customer_tower_is_item_independent`.
-
-### 9b.2 Training
+### 9.1 Objective
 
 ```python
 def sampled_softmax_loss(
@@ -711,7 +638,7 @@ def sampled_softmax_loss(
 
     logits[i][j] = cust[i] · item[j] / T  −  log_q[item_ids[j]]
 
-    Without the log-Q term, in-batch negatives are drawn proportional to item
+    Without the log-Q term, in-batch negatives arrive proportional to item
     popularity, so the model is rewarded for demoting popular items and drifts
     toward an inverted-popularity ranker. Targets are the diagonal.
     """
@@ -720,60 +647,142 @@ def sampled_softmax_loss(
 | Setting | Value |
 |---|---|
 | Objective | In-batch sampled softmax, log-Q corrected |
-| `log_q` estimate | Streaming item-frequency counter over train positives, `log(count / total)` |
+| `log_q` estimate | Streaming item-frequency counter over retriever-window positives, `log(count / total)` |
 | Batch | 512 positives — **batch size is the negative count** |
-| Optimizer | AdamW, discriminative LRs: **1e-3 towers, 2e-5 encoder** |
+| Optimizer | AdamW; discriminative LRs **1e-3 towers, 2e-5 encoder** |
 | Schedule | 10% linear warmup, cosine decay |
-| Epochs | 2, val-selected by AUC on the val rows |
+| Epochs | 2, selected on `val` `recall@100` |
 | Device | `mps`, `--device cpu` fallback |
 | Seeds | 3 |
 
-**Training consumes positives only** (~520k), not the 5.7M sampled rows — in-batch negatives
-are free. At batch 512 that is ~1,000 steps/epoch, **≈4–6 min/epoch on MPS**, making these
-arms cheaper than the LightGBM arms.
+**Training consumes positives only** (~260k pairs across the four retriever windows) — in-batch
+negatives are free. At batch 512 that is ~500 steps/epoch, **≈3–5 min/epoch on MPS**.
 
-**Batch construction**: articles repeat across rows, so each batch dedupes article IDs,
-encodes unique texts once, and gathers — the same efficiency property as §8. Duplicate items
-within a batch are masked out of the negative set, since an item cannot be its own negative.
+**Batch construction**: articles repeat across pairs, so each batch dedupes article IDs, encodes
+each unique text once, and gathers. Duplicate items within a batch are masked out of the
+negative set — an item cannot be its own negative.
 
-### 9b.3 Arms
+### 9.2 Positive pairs
 
-| # | Arm | Encoder | Trained |
+A positive is a (customer, purchased-article) pair from a retriever window. Capped at **≤5 pairs
+per customer and ≤50 per article**.
+
+> Uncapped sampling is dominated by heavy buyers and bestsellers, which pushes the encoder back
+> toward a popularity proxy — the same contamination log-Q guards against, arriving by a
+> different route. The popularity-ρ diagnostic (§9.5) is the check that both guards worked.
+
+### 9.3 Arms
+
+| Arm | Item tower | Seeds | Runs |
 |---|---|---|---|
-| 9 | `twotower_frozen` | frozen pretrained | towers only — article embeddings precomputed, so no encoder forward pass |
-| 10 | **`twotower_e2e`** | trained jointly | towers + encoder end-to-end |
+| `pop` | none — top-`K` by `art_pop_12w` before `W.start` | — | 0 (deterministic) |
+| `R1` | taxonomy + numerics | 3 | 3 |
+| `R2` | `R1` + `detail_desc` (Text-B) | 3 | 3 |
+| `R2-A` | `R1` + full text concat (Text-A) | 1 | 1 |
 
-### 9b.4 Evaluation and the comparability boundary
+`R2 − R1` is H2. `R2-A − R2` quantifies how much apparent text lift is re-encoded taxonomy.
 
-Arms 9/10 train on a different negative distribution than arms 1–8 (PRD §5, §7). Handling:
+`R2` at the val-selected seed is the **frozen retriever** for all of stage 2. Chosen on `val`
+`recall@100`, recorded in the candidate manifest, and never revisited.
 
-| Metric class | Comparable? | Handling |
-|---|---|---|
-| AUC, PR-AUC, precision@k, MAP@12, NDCG | **Yes** | Scored on the identical test rows; the score is a dot product computable for any pair |
-| Log-loss, Brier, reliability | Not directly | Isotonic fit on **val** rows via `eval/calibration.py:fit_isotonic`, then applied to test. Prior correction does not apply — there is no fixed downsampling rate `w` for in-batch negatives |
-| Business proxy | After recalibration only | Needs probabilities, so it runs on isotonic-calibrated scores |
+### 9.4 Item vector precomputation
 
-The `10 − 7b` delta reflects **architecture and training objective together**. Reported with
-that caveat inline in `reports/results.md`, not as a clean neural-vs-GBDT isolation.
+```
+contentsignal embed --retriever R2 --seed N
+```
 
-### 9b.5 Diagnostics
+Runs the frozen item tower over all ~105k articles in batches of 256 and writes §4.7. This is
+the step that makes the transformer's steady-state serving cost ≈0: everything downstream reads
+a 54 MB mmap'd matrix, and the encoder never runs online except for genuinely new articles.
 
-- **Popularity ρ** — Spearman between arm-10 scores and `log(art_pop_12w + 1)`. A two-tower
-  that has collapsed to popularity re-ranking fails here, and log-Q is the first thing to
-  check.
-- **log-Q ablation** — one run with the correction disabled, to demonstrate its effect rather
-  than assert it.
-- **Tower vector norms and pairwise cosine spread** — the same collapse check as §8.3.
+### 9.5 Diagnostics — reported whatever they show
 
-### 9b.6 Run matrix addition
+| Diagnostic | Failure signal |
+|---|---|
+| **Popularity ρ** — Spearman between retriever score and `log(art_pop_12w + 1)` | High ρ means the retriever collapsed into a popularity re-ranker. Check log-Q first |
+| **log-Q ablation** — one run with the correction disabled | Demonstrates the correction's effect rather than asserting it |
+| **Vector norms + pairwise cosine spread** | Near-identical vectors = embedding collapse; the loss can look fine while retrieval is meaningless |
+| **Nearest-neighbour dumps for ~20 articles** | The cheapest check that the space is fashion-shaped |
+| **MPS/CPU parity** | Vectors must agree within tolerance on a fixed sample; MPS backends are periodically unstable |
 
-| Arms | Text variants | Seeds | Runs |
+---
+
+## 9b. Stage 2 — ranker specifications
+
+All three consume the identical 47 columns from the identical candidate rows.
+
+### 9b.1 `lgbm` — the tabular baseline
+
+```yaml
+# conf/model/lgbm.yaml
+objective: binary
+num_leaves: 127
+max_bin: 63                     # NOT a tuning choice — see §14
+learning_rate: 0.05
+n_estimators: 2000
+early_stopping_rounds: 100      # on the val window
+feature_fraction: 0.8
+bagging_fraction: 0.8
+bagging_freq: 1
+min_data_in_leaf: 100
+num_threads: 7
+```
+
+All eleven categoricals passed as native `categorical_feature`. `free_raw_data=True` after
+`Dataset.construct()`.
+
+### 9b.2 `mlp`
+
+Categorical embeddings (8–16 d per field, 13 fields including the two customer categoricals) ⊕
+standardized numerics → MLP **[512, 256, 128]** → 1. GELU, dropout 0.1, batch norm on the
+numeric block. Input dim ≈ 190.
+
+### 9b.3 `dcn` — DCN-v2
+
+Parallel structure. Both stacks read the same input `x₀`:
+
+```
+cross layer:  x_{l+1} = x₀ ⊙ (W_l x_l + b_l) + x_l          # 3 layers, full W
+deep stack:   MLP [512, 256]
+head:         concat(cross_out, deep_out) → linear → 1
+```
+
+The cross layers explicitly multiply feature pairs, so the model can discover interactions like
+`cust_age × index_group` without them being hand-written. **That is precisely the comparison:
+`dcn` versus `mlp` measures learned crossing against the six hand-built crosses in §6.4, on
+identical inputs.**
+
+At input dim ≈190, a full-matrix cross layer is 190² ≈ 36k params; three layers plus the deep
+stack is ~400k total. The low-rank DCN-v2 variant exists for wide industrial inputs and is
+unnecessary here — **the rankers are tiny; memory is dominated by the data, not the model.**
+
+### 9b.4 Shared training settings
+
+| Setting | Value |
+|---|---|
+| Loss | Binary cross-entropy |
+| Batch | 4096 rows, streamed from Parquet — the design matrix is never materialized |
+| Optimizer | AdamW, lr 1e-3, cosine decay, 10% warmup |
+| Epochs | 3, early stopping on `val` NDCG@12 |
+| Seeds | 3 |
+
+**Hyperparameters are tuned on `lgbm` only, then frozen** for `mlp` and `dcn`. Tuning each arm
+separately would confound "better architecture" with "more tuning budget," and the resulting
+delta would measure effort rather than design.
+
+### 9b.5 Run matrix
+
+| Stage | Arms | Seeds | Runs |
 |---|---|---|---|
-| 9, 10 | A, B | 3 | 12 |
-| Sensitivity: log-Q disabled on arm 10 | B | 1 | 1 |
-| | | | **13** |
+| Retrieval | `R1`, `R2` | 3 | 6 |
+| Retrieval sensitivity | `R2-A`; log-Q disabled on `R2` | 1 | 2 |
+| Ranking | `lgbm`, `mlp`, `dcn` | 3 | 9 |
+| H3 | val-selected ranker on random negatives | 3 | 3 |
+| Sensitivity | uniform negatives (appendix) | 1 | 1 |
+| | | | **21** |
 
-Total across the project: **48 + 13 = 61 runs**.
+`pop` and the `K` sweep add no training runs — `pop` is deterministic and the sweep is a single
+retrieval pass. Down from 61 in the previous design.
 
 ---
 
@@ -784,127 +793,164 @@ Total across the project: **48 + 13 = 61 runs**.
 ```python
 # eval/metrics.py
 def auc(y: np.ndarray, p: np.ndarray) -> float: ...
-def pr_auc(y, p) -> float: ...
-def log_loss(y, p) -> float: ...
-def brier(y, p) -> float: ...
+def pr_auc(y: np.ndarray, p: np.ndarray) -> float: ...
+def log_loss(y: np.ndarray, p: np.ndarray) -> float: ...
+def brier(y: np.ndarray, p: np.ndarray) -> float: ...
 
 # eval/ranking.py — per customer, then averaged
-def precision_at_k(y, p, customer: np.ndarray, k: int) -> float: ...
-def recall_at_k(y, p, customer, k: int) -> float: ...
-def map_at_k(y, p, customer, k: int = 12) -> float: ...
-def ndcg_at_k(y, p, customer, k: int = 12) -> float: ...
+def precision_at_k(ranked: pl.DataFrame, *, k: int) -> float: ...
+def recall_at_k(ranked: pl.DataFrame, *, k: int) -> float: ...
+def map_at_k(ranked: pl.DataFrame, *, k: int = 12) -> float: ...
+def ndcg_at_k(ranked: pl.DataFrame, *, k: int = 12) -> float: ...
 ```
 
-### 10.2 Bootstrap
+### 10.2 Retrieval metrics — `eval/retrieval.py`
 
 ```python
-# eval/bootstrap.py
-@dataclass(frozen=True)
-class BootstrapResult:
-    point: float
-    lo: float                # 2.5th percentile
-    hi: float                # 97.5th percentile
-    p_gt_zero: float
+def recall_at_k(retrieved: pl.DataFrame, all_positives: pl.DataFrame, *,
+                k: int) -> float:
+    """Fraction of true positives appearing in the top k, per customer then averaged.
 
-def bootstrap_delta(
-    y: np.ndarray, p_a: np.ndarray, p_b: np.ndarray,
-    customer: np.ndarray, *, metric: Callable, n: int = 1000, seed: int,
-) -> BootstrapResult: ...
+    `all_positives` is the window's FULL positive set. A positive absent from
+    `retrieved` contributes 0 — never dropped from the denominator.
+    """
 
-def bootstrap_delta_of_deltas(
-    y: np.ndarray, p_a: np.ndarray, p_b: np.ndarray,
-    customer: np.ndarray, slice_mask: np.ndarray,
-    *, metric: Callable, n: int = 1000, seed: int,
-) -> BootstrapResult:
-    """The H2 statistic: delta on the slice minus delta on all rows (PRD §1).
+def recall_at_k_per_customer(...) -> pl.DataFrame:
+    """Per-customer values, so eval/bootstrap.py can resample over customers."""
 
-    Both deltas are computed from the SAME customer resample on each iteration.
-    Customers appear in both populations — a customer can have cold-start and
-    established candidates in one basket — so two independent bootstraps would
-    treat correlated quantities as independent and understate the CI.
+def coverage(retrieved: pl.DataFrame, *, catalog_size: int) -> float:
+    """Fraction of the catalog appearing in ANY customer's top-k.
+
+    A retriever returning the same 500 bestsellers to everyone can post an
+    acceptable recall@K and be useless. Recall alone does not catch it.
+    """
+
+def cold_start_recall_at_k(retrieved, all_positives, articles, *,
+                           k: int, threshold: int = 10) -> float: ...
+
+def popularity_rho(scores: pl.DataFrame, articles: pl.DataFrame) -> float: ...
+```
+
+### 10.3 The `K` sweep
+
+`recall@K` for every K in `candidates.k_sweep` is computed from **one** retrieval pass at
+`K = max(k_sweep)` by truncation — no retraining, no re-retrieval. This is why H1's retrieval
+axis is cheap relative to its ranker axis, and the asymmetry is itself part of the finding.
+
+### 10.4 End-to-end metrics — the invariant that matters most
+
+```python
+def map_at_k_e2e(ranked: pl.DataFrame, all_positives: pl.DataFrame, *,
+                 k: int = 12) -> float:
+    """Pipeline-level MAP@k over EVERY positive in the window.
+
+    Positives stage 1 never retrieved cannot appear in `ranked`, and they count as
+    misses. Computing MAP only over retrieved candidates flatters the pipeline by
+    exactly the retriever's miss rate, and the output looks entirely healthy while
+    doing so — which is what makes it the most likely silent error in a two-stage
+    evaluation.
     """
 ```
 
-**Resamples customer IDs, then gathers all rows belonging to the drawn customers.** Rows
-within a customer share history features and basket composition; row-level resampling would
-produce CIs narrow enough to let noise clear the ΔAUC ≥ 0.005 bar (PRD §1).
+**Hand-checkable consequence: end-to-end MAP@12 must be strictly below ranking-only MAP@12 for
+every arm.** If they are equal, the accounting is broken and every headline number is inflated.
+Asserted in `tests/test_e2e_metrics.py`.
 
-Implementation: precompute a customer → row-index offset array once, so each resample is a
-gather rather than a filter. 1000 resamples over ~600k test rows runs in well under a
-minute per arm.
-
-### 10.3 Calibration
+### 10.5 Slices
 
 ```python
-# eval/calibration.py
+# eval/slices.py
+SLICES = {
+    "all":            lambda df: df,
+    "cold_start":     lambda df: df.filter(pl.col("art_is_cold") == 1),
+    "low_history":    lambda df: df.filter(pl.col("cust_txn_12w") <= LOW_HISTORY_THRESHOLD),
+}
+```
+
+Both thresholds are set **once at M1** from the measured distributions and registered. Retuning
+a slice boundary after seeing results is p-hacking with extra steps.
+
+### 10.6 Bootstrap — `eval/bootstrap.py`
+
+```python
+def bootstrap_delta(
+    per_customer_a: pl.DataFrame, per_customer_b: pl.DataFrame,
+    *, metric: Callable, n_resamples: int = 1000, seed: int = 17,
+) -> tuple[float, float, float]:
+    """Point estimate and 95% CI on (a − b), resampling CUSTOMERS.
+
+    Rows within a customer share history features and basket composition, so
+    row-level resampling treats correlated observations as independent and produces
+    intervals narrow enough for noise to clear the significance bar.
+    """
+
+def bootstrap_delta_of_deltas(...) -> tuple[float, float, float]:
+    """For H1 and H2: CI on (Δ₁ − Δ₂), computed on SHARED customer resamples.
+
+    Independent resamples would inflate the variance of the difference and bias the
+    test toward a null.
+    """
+```
+
+### 10.7 Calibration — `eval/calibration.py`
+
+```python
 def prior_correct(p_sampled: np.ndarray, *, w: float) -> np.ndarray:
-    """w = negative downsampling rate. PRD §5."""
-    return p_sampled / (p_sampled + (1.0 - p_sampled) / w)
+    """p_true = p_s / (p_s + (1 - p_s) / w). Strictly monotone, so AUC is unchanged."""
 
-def fit_isotonic(p_val: np.ndarray, y_val: np.ndarray) -> IsotonicRegression: ...
-def reliability_curve(y, p, *, bins: int = 20) -> tuple[np.ndarray, np.ndarray]: ...
+def fit_isotonic(y_val: np.ndarray, p_val: np.ndarray) -> IsotonicRegression: ...
 ```
 
-Applied by the evaluator, once, never inside an arm. Log-loss is reported **twice** —
-sampled and prior-corrected, both explicitly labelled. AUC and the ranking metrics are
-computed on uncorrected scores, since the correction is monotone and cannot change ranks.
+| Arm | Path | Why |
+|---|---|---|
+| All main-grid rankers | **Isotonic fit on `val`** | Retrieval-induced sampling has no fixed downsampling rate `w` — how many negatives a customer receives depends on what the retriever returned |
+| H3 random-negative arm | Prior correction **and** isotonic | It has a genuine fixed `w = 1/10`, so the two paths can be compared as a check that neither is broken |
 
-### 10.4 Slices
+Rank metrics (AUC, NDCG, MAP, `recall@K`) are unaffected either way. Reliability curves are
+reported per arm, so calibration quality is visible rather than asserted.
 
-Every metric is computed on three populations (PRD §8):
-
-| Slice | Predicate |
-|---|---|
-| `all` | — |
-| `cold_start` | `art_is_cold == 1` (`art_prior_purchases < 10`) |
-| `low_history` | customer has `< 5` prior purchases at `as_of` |
-
-The `cold_start` slice is where text should win if it wins anywhere — popularity features
-are near-zero there while text is fully available — and it carries the project's strongest
-business argument.
-
-### 10.5 Business proxy
+### 10.8 Business proxy — `eval/business.py`
 
 ```python
-# eval/business.py
-def expected_revenue_at_k(price, p_corrected, customer, k) -> float: ...
-def aov_lift_ratio(price, p_model, p_baseline, y, customer, k) -> float: ...
+def expected_revenue_at_k(ranked: pl.DataFrame, *, k: int) -> float: ...
+def aov_lift_ratio(model: pl.DataFrame, baseline: pl.DataFrame, *, k: int) -> float: ...
 ```
 
-Computed on **prior-corrected** probabilities only. Reported as ratios in relative units,
-with the scaled-price caveat (PRD §2) printed inline in the results table, not footnoted.
+Both run on **calibrated** probabilities only, and both return ratios. `price` is scaled and
+anonymized (`prd.md` §3); a currency figure would be fabricated.
 
 ---
 
 ## 11. Experiment tracking
 
-**MLflow, local file backend** at `artifacts/mlruns` — no server, no network.
+Runs **dual-write**:
 
-| | |
-|---|---|
-| Experiment | `contentsignal` |
-| Run name | `{arm}_{variant}_{svd}_s{seed}` e.g. `lgbm_ft_pers_b_32_s1` |
-| Params | `arm`, `text_variant`, `embedding_source`, `svd_dim`, `seed`, `git_sha`, `config_sha256`, `rows_digest`, `cohort_size`, `sampler_ratio` |
-| Metrics | every metric × every slice, as `{slice}/{metric}` |
-| Artifacts | reliability curve, feature importance, NN dumps, per-run config snapshot |
-
-### Dual-write to git
-
-Every run **also** writes `reports/metrics/{run_name}.json`, which **is** committed:
+1. **MLflow**, local file backend at `artifacts/mlruns`. Params include `config_sha256`, the
+   candidate-set digest, the retriever checkpoint digest, arm, seed, and `K`.
+2. **`reports/metrics/{run_name}.json`**, git-committed.
 
 ```json
 {
-  "run_name": "lgbm_ft_pers_b_32_s1",
-  "git_sha": "...", "config_sha256": "...", "rows_digest": "...",
-  "arm": "lgbm_ft_pers", "text_variant": "b", "svd_dim": 32, "seed": 1,
-  "metrics": { "all": {"auc": 0.0, "logloss_sampled": 0.0, "...": 0.0},
-               "cold_start": {}, "low_history": {} }
+  "run_name": "dcn_retrieved_s1",
+  "stage": "ranking",
+  "arm": "dcn",
+  "retriever": "R2", "retriever_seed": 1,
+  "k": 100,
+  "candidates_sha256": "…",
+  "config_sha256": "…",
+  "split": "val",
+  "metrics": {
+    "all":        {"auc": 0.812, "ndcg@12": 0.104, "map@12": 0.061, "map@12_e2e": 0.025},
+    "cold_start": {"...": 0.0},
+    "low_history":{"...": 0.0}
+  },
+  "latency": {"p50_ms_per_1k": 0.0, "p95_ms_per_1k": 0.0}
 }
 ```
 
-`make report` regenerates the tables in `reports/results.md` from these files.
-**No number in the report is ever hand-typed**, and a metric change shows up as a reviewable
-diff. MLflow is for exploring the 61 runs; the JSON is the record of what was claimed.
+`make report` regenerates every table in `reports/results.md` from these files. **No number in
+the report is ever hand-typed**, and a metric change shows up as a reviewable diff. MLflow is
+for exploring the 21 runs; the committed JSON is the record of what was claimed.
 
 ---
 
@@ -919,49 +965,85 @@ class BenchResult:
     p95_ms_per_1k: float
     throughput_per_s: float
     peak_rss_mb: float
+    nbytes: int | None
 
 def bench(config: str, *, n_batches: int = 100, batch: int = 1000) -> BenchResult: ...
 ```
 
+### 12.1 Configurations — per stage, so the budget is attributable
+
 | Config | What it isolates |
 |---|---|
-| `lgbm_tab` | Baseline serving cost |
-| `lgbm_ft_pers_cached` | Marginal cost of the text arm at steady state (mmap gather + cosine) |
-| `encoder_cold_mps` | Tokenize + forward at request time, MPS |
-| `encoder_cold_cpu` | Same on CPU — the realistic commodity-server number |
+| `stage1_customer_tower` | One customer-vector forward pass |
+| `stage1_topk_exact` | Brute-force matvec over 105k × 128 + top-`K` |
+| `stage1_topk_faiss` | The same via a FAISS IVF index |
+| `stage2_lgbm` / `stage2_mlp` / `stage2_dcn` | Ranker forward over `K` candidates |
+| `e2e_k100` / `e2e_k500` | Full pipeline at two depths — the latency half of H1 |
+| `encoder_cold_cpu` | Tokenize + forward for a new article, CPU — the realistic commodity-server number |
 | `encoder_onnx_int8` | Optimized cold path via `optimum` export |
 
-Protocol: 20 warmup batches discarded, 100 measured, single process, `num_threads=7`,
-machine otherwise idle. Reported with the measured `peak_rss_mb` so the memory claim is
-evidence rather than arithmetic.
+Protocol: 20 warmup batches discarded, 100 measured, single process, `num_threads=7`, machine
+otherwise idle. Reported with measured `peak_rss_mb` and `nbytes`.
 
-Converted to **$/1M predictions** against one named cloud SKU, with instance type and
-price-lookup date cited inline.
+### 12.2 The exact-versus-approximate question
 
-**The claim to confirm** (PRD §9): 105k × 384 × 4 B ≈ 162 MB fp32 / ~40 MB int8, so the
-whole catalog fits in cache and steady-state encoder cost is ≈ 0 — the cold path matters
-only for new articles. `bench` prints `EmbeddingCache.nbytes` alongside the latency table so
-the claim is measured, not asserted.
+`stage1_topk_exact` against `stage1_topk_faiss`, reported with both latencies **and** the recall
+FAISS gives up relative to exact search. At 105k × 128 the expectation is that exact wins or
+ties, making the index unnecessary infrastructure. **If FAISS wins, that is reported too** —
+the point is to measure rather than to confirm.
+
+### 12.3 The claim to confirm
+
+```
+105,000 × 128 × 4 B  ≈   54 MB   (item vectors, fp32)
+105,000 × 384 × 4 B  ≈  162 MB   (raw encoder output, fp32)
+105,000 × 384 × 1 B  ≈   40 MB   (int8)
+```
+
+`bench` prints `ItemIndex.nbytes` alongside the latency table, so the memory claim is evidence
+rather than arithmetic. If it holds, the transformer's steady-state cost is ≈0 — it is an
+offline batch job feeding a lookup table, and the cold path matters only for new articles.
+
+### 12.4 The stage-attribution table — the H1 deliverable
+
+Generated by `make report`, one row per intervention:
+
+| Intervention | ΔMAP@12 (e2e) | 95% CI | Δp95 ms | Δ$/1M | Δ per ms |
+|---|---|---|---|---|---|
+| `K` 100 → 200 | | | | | |
+| `K` 100 → 500 | | | | | |
+| `R1` → `R2` (text in retriever) | | | | | |
+| `lgbm` → `mlp` | | | | | |
+| `lgbm` → `dcn` | | | | | |
+| random → hard negatives | | | | | |
+
+The last column is what makes retrieval and ranking commensurable, and H1 is the comparison
+between its rows.
 
 ---
 
 ## 13. CLI surface
 
-`typer`-based, installed as `contentsignal`. Every command is **idempotent** and skips work
-when its outputs exist with a matching config hash, unless `--force`.
+`typer`-based, installed as `contentsignal`. Every command is **idempotent** and skips work when
+its outputs exist with a matching `config_sha256`, unless `--force`.
 
 | Command | Reads | Writes |
 |---|---|---|
 | `ingest` | Kaggle CSVs | `artifacts/parquet/*` |
-| `sample` | transactions, cohort | `artifacts/rows/*`, `rows_manifest.json` |
-| `build-features --group G --window W` | transactions, rows | `artifacts/features/G/W.parquet` |
-| `embed --variant a\|b --source frozen\|contrastive` | articles, checkpoint | `artifacts/emb/*` |
-| `finetune --variant a\|b --seed N` | transactions, articles | checkpoint, diagnostics |
-| `train --arm A --variant V --seed N` | features, rows | model, MLflow run, metrics JSON |
-| `train-twotower --arm 9\|10 --variant a\|b --seed N` | positives, articles, history | tower checkpoints, MLflow run, metrics JSON |
-| `evaluate --arm A ...` | model, features | metrics JSON, figures |
-| `bench --config C` | model, embedding cache | `reports/metrics/bench.json` |
+| `splits` | `conf/split.yaml` | — (prints the window table with roles) |
+| `sample` | transactions, cohort | cohort, per-window positives, `artifacts/rows_random/*` |
+| `build-features --group G --window W` | transactions, candidates | `artifacts/features/G/W.parquet` |
+| `train-retriever --arm pop\|R1\|R2 --variant a\|b --seed N` | positives, articles, customers | tower checkpoint, diagnostics, metrics JSON |
+| `embed --retriever R --seed N` | checkpoint, articles | `artifacts/vectors/*` |
+| `retrieve --window W --k K` | checkpoint, vectors, transactions | `artifacts/candidates/W.parquet`, manifest |
+| `train-ranker --arm lgbm\|mlp\|dcn --negatives retrieved\|random --seed N` | features, candidates | model, MLflow run, metrics JSON |
+| `evaluate --stage retrieval\|ranking\|e2e --arm A --split val\|test` | model, features, positives | metrics JSON, figures |
+| `bench --config C` | checkpoints, vectors | `reports/metrics/bench.json` |
 | `report` | `reports/metrics/*.json` | `reports/results.md` |
+
+`finetune` is **gone**. There is no separate contrastive pre-training stage: in-batch softmax
+over co-purchase pairs *is* a contrastive objective, and the encoder trains jointly with the
+towers inside `train-retriever`.
 
 A `Makefile` chains these into `make m1` … `make m9` matching the milestones.
 
@@ -973,33 +1055,31 @@ Against the 8 GB ceiling, with ~1.5 GB reserved for OS and overhead → **~6.5 G
 
 | Stage | Peak RSS | How it stays bounded |
 |---|---|---|
-| `ingest` | **~1.5 GB** | DuckDB streams CSV → Parquet; never materializes 31.8M rows in memory |
-| `sample` | **~1.2 GB** | Per-window; alias table is ~60k entries; positives per window ~65k |
+| `ingest` | **~1.5 GB** | DuckDB streams CSV → Parquet; 31.8M rows never materialize |
+| `sample` | **~1.2 GB** | Per-window; alias table ~60k entries; positives ~65k |
 | `build-features` (tabular) | **~2.5 GB** | Per-window DuckDB aggregation, Polars result only |
-| `embed` | **~1.0 GB** | 105k texts at batch 256; output 162 MB |
-| `finetune` | **~1.5 GB** | 22M params × 4 (weights + grads + 2 Adam states) ≈ 350 MB, plus activations for 128 × 64 tokens |
-| `build-features` (taste) | **~1.5 GB** | Per-window; 80k × 384 float32 ≈ 123 MB, plus the 162 MB cache mmapped |
-| `train` (LightGBM) | **~3.5 GB** | See below |
-| `train-twotower` | **~3.0 GB** | 30M params (22M encoder + 6.7M item-ID table + ~1M towers) × 4 B × 4 Adam states ≈ 480 MB; activations for batch 512 with ~450 unique texts × 64 tokens ≈ 700 MB; history tensors negligible |
-| `evaluate` | **~1.5 GB** | Test window only, ~600k rows |
+| `train-retriever` | **~3.0 GB** | ~30M params (22M encoder + 6.7M customer-ID table + ~1M towers) × 4 B × 4 Adam states ≈ 480 MB; activations for batch 512 with ~450 unique texts × 64 tokens ≈ 700 MB |
+| `embed` | **~1.0 GB** | 105k articles at batch 256; output 54 MB |
+| `retrieve` | **~1.0 GB** | 54 MB mmap'd index; customers chunked at 4096; `[4096 × 105k]` score block computed in tiles, never held whole |
+| `train-ranker` (`lgbm`) | **~2.0 GB** | See below |
+| `train-ranker` (`mlp`/`dcn`) | **~1.5 GB** | ~400k params; minibatches of 4096 streamed from Parquet, design matrix never materialized |
+| `evaluate` | **~1.5 GB** | One window at a time |
 
 ### The LightGBM budget in detail
 
-The binding constraint. At 5M train rows × 80 columns:
+Still the binding constraint, though less tight than before. At 5M rows × 47 columns:
 
 | | |
 |---|---|
-| Raw float32 matrix | 5M × 80 × 4 B = **1.6 GB** |
-| Binned, `max_bin=63` → uint8 | 5M × 80 × 1 B = **400 MB** |
-| Histograms | 127 leaves × 80 features × 63 bins × 2 doubles ≈ **10 MB** |
+| Raw float32 matrix | 5M × 47 × 4 B = **940 MB** |
+| Binned, `max_bin=63` → uint8 | 5M × 47 × 1 B = **235 MB** |
+| Histograms | 127 leaves × 47 features × 63 bins × 2 doubles ≈ **6 MB** |
 | Prediction/gradient buffers | ~120 MB |
 
-`max_bin=63` is therefore **not** a tuning choice — it is what makes the run fit. Combined
-with `free_raw_data=True` after `Dataset.construct()`, peak lands near **2.2 GB**, with
-headroom for the transient raw matrix during construction (~3.5 GB peak).
-
-Enabling `include_raw_dims` (§6.6) adds 32 columns → +640 MB raw / +160 MB binned, which is
-why it is an opt-in sensitivity run rather than a default.
+`max_bin=63` is therefore **not** a tuning choice — it is what makes the run fit. Combined with
+`free_raw_data=True` after `Dataset.construct()`, peak lands near **1.3 GB**, with headroom for
+the transient raw matrix during construction (~2.0 GB peak). Dropping the 32 embedding columns
+(§7) is what bought the difference from the previous design's 3.5 GB.
 
 ### Wall-clock estimates
 
@@ -1007,13 +1087,12 @@ why it is an opt-in sensitivity run rather than a default.
 |---|---|
 | M0 install + download | 30–60 min (network-bound) |
 | M1 ingest + EDA + leakage tests | 45 min |
-| M2 sampling + tabular features (10 windows) | 1.5–2 h |
-| M3 baselines | 30 min |
-| M4 frozen embeddings + taste vectors + arms 4a/4b | 1.5 h |
-| M5 contrastive fine-tune (2 variants × 3 seeds) | 1.5 h |
-| M6 arms 7a/7b + sensitivity + bootstrap | 3–4 h |
-| M6b two-tower arms 9/10 (13 runs) | 2–3 h |
-| M7 calibration + business proxy | 45 min |
+| M2 cohort, positives, features (10 windows) | 1.5–2 h |
+| M3 retrievers (`R1`, `R2`, `R2-A`, log-Q ablation) | 1.5–2 h |
+| M4 retrieval eval + `K` sweep + bootstrap | 45 min |
+| M5 candidate generation (6 windows) + retrieval features | 1 h |
+| M6 three rankers × 3 seeds | 2–3 h |
+| M7 H3 ablation + calibration + business proxy | 1 h |
 | M8 cost profiling | 45 min |
 | M9 report | — |
 
@@ -1023,14 +1102,14 @@ why it is an opt-in sensitivity run rather than a default.
 
 ### `tests/test_leakage.py`
 
-**The deletion-invariance property**, applied to every feature builder — the general form of
-every leakage check in this project:
+**The deletion-invariance property**, applied to every registered feature builder — the general
+form of every leakage check in this project:
 
 ```python
 @pytest.mark.parametrize("builder", ALL_BUILDERS)
 def test_features_are_invariant_to_future_deletion(builder, synthetic_txns):
     as_of = date(2020, 6, 1)
-    full     = builder.build(synthetic_txns, as_of=as_of, entities=E)
+    full      = builder.build(synthetic_txns, as_of=as_of, entities=E)
     truncated = builder.build(
         synthetic_txns.filter(pl.col("t_dat") < as_of), as_of=as_of, entities=E
     )
@@ -1041,42 +1120,55 @@ Plus:
 
 | Test | Assertion |
 |---|---|
-| `test_negative_candidates_have_prior_history` | Every sampled negative article has ≥1 transaction before `W.start` |
-| `test_contrastive_pairs_predate_val` | `max(t_dat)` over all pair source transactions `< 2020-08-26` |
-| `test_svd_fitted_on_train_articles_only` | The fitted SVD's article index ∩ (val ∪ test-only articles) = ∅ |
-| `test_taste_vectors_respect_as_of` | Deletion-invariance, applied to `taste_vectors` |
-| `test_no_builder_signature_lacks_as_of` | Introspects every `FeatureBuilder.build` — `as_of` is present and keyword-only |
+| `test_retriever_windows_precede_candidate_windows` | **New.** `max(end)` over `role == "retriever"` windows < `min(start)` over every candidate window. A retriever that trained on a window it retrieves for has memorized the labels |
+| `test_candidates_have_prior_history` | Every retrieved article had ≥1 transaction before `W.start` — the `allowed` mask actually applied |
+| `test_negative_candidates_have_prior_history` | Same, for the H3 random-negative sampler |
+| `test_no_builder_signature_lacks_as_of` | Introspects every `FeatureBuilder.build` — `as_of` present, keyword-only, no default |
+| `test_history_excludes_the_cutoff_date` | `history()` uses strict `<`: a transaction dated exactly `as_of` is the label window's first day and must not be visible |
+| `test_every_builder_module_is_imported_by_the_package` | Every module beside `features/base.py` is imported by `features/__init__.py`. `ALL_BUILDERS` fills by import side effect, so an unimported builder leaves the harness green while covering nothing |
+| `test_customer_history_respects_as_of` | Deletion-invariance applied to the tower's `hist_ids` construction |
 
 ### `tests/test_splits.py`
 
-Windows are contiguous, non-overlapping, 14 days each; train `end` < val `start` < test
-`start`; every window lies inside the dataset's date range.
+Windows are contiguous, non-overlapping, 14 days each; every window lies inside the dataset
+range; roles are ordered `retriever` < `ranker` < `val` < `test`; exactly one `val` and one
+`test` window; `windows_for_role` and `candidate_windows` return what their names claim.
+
+### `tests/test_retrieval.py`
+
+| Test | Assertion |
+|---|---|
+| `test_customer_tower_is_item_independent` | `CustomerTower.forward` accepts no item argument, and its output is bit-identical for the same customer across different candidate batches. **This is what keeps both towers precomputable and retrieval possible** |
+| `test_logq_correction_applied` | On a synthetic skewed item distribution, corrected logits recover uniform expected ranking; uncorrected ones do not |
+| `test_in_batch_duplicates_masked` | An item appearing twice in a batch is never its own negative |
+| `test_output_is_l2_normalized` | Both tower outputs have unit norm within tolerance |
+| `test_recall_at_k_is_monotone` | `recall@K` is non-decreasing in K. A violation means the truncation in §10.3 is wrong |
+| `test_topk_respects_allowed_mask` | Masked articles never appear in output, at any `K` |
+| `test_index_lookup_matches_dense` | `ItemIndex.topk` agrees with a naive dense argsort on a small fixture |
+| `test_candidate_digest_detects_mutation` | Flipping one byte of a candidate file makes `assert_digest` raise |
+
+### `tests/test_e2e_metrics.py`
+
+| Test | Assertion |
+|---|---|
+| `test_e2e_metrics_count_unretrieved_positives` | A synthetic window where stage 1 misses a known positive yields end-to-end MAP **strictly below** ranking-only MAP |
+| `test_e2e_recall_bounded_by_retrieval_recall` | End-to-end `recall@12` ≤ `recall@K` for every arm — the pipeline ceiling, asserted rather than assumed |
+| `test_perfect_ranker_hits_retrieval_ceiling` | With an oracle ranker, end-to-end `recall@12` equals `recall@K` when `K ≤ 12`; this pins the ceiling arithmetic |
 
 ### `tests/test_sampling.py`
 
-| Test | Assertion |
-|---|---|
-| `test_ratio_exact` | `negatives == ratio × positives` per customer |
-| `test_no_positive_sampled_as_negative` | The two sets are disjoint per (customer, window) |
-| `test_no_duplicate_negatives` | Per customer, `len(set(negatives)) == len(negatives)` |
-| `test_determinism` | Two runs at the same seed produce byte-identical Parquet |
-| `test_popularity_weighting` | Over many draws, empirical frequency ∝ weight^0.75 within tolerance |
-
-### `tests/test_twotower.py`
-
-| Test | Assertion |
-|---|---|
-| `test_customer_tower_is_item_independent` | `CustomerTower.forward` accepts no item argument, and its output is bit-identical for the same customer across different candidate batches. This is what keeps both towers precomputable and the §12 serving analysis valid |
-| `test_logq_correction_applied` | With a synthetic skewed item distribution, corrected logits recover uniform expected ranking; uncorrected ones do not |
-| `test_in_batch_duplicates_masked` | An item appearing twice in a batch is never its own negative |
-| `test_history_mask_respects_as_of` | Deletion-invariance (§15) applied to history construction — no purchase at or after `W.start` enters `hist_ids` |
-| `test_output_is_l2_normalized` | Both tower outputs have unit norm within tolerance |
+Retained for the H3 arm: exact ratio per customer, positives never sampled as negatives, no
+duplicate negatives, byte-identical output at a fixed seed, per-window seed stable across
+`PYTHONHASHSEED` values, popularity weighting correct over many draws, and a pool too small to
+supply `ratio` distinct negatives raises rather than returning a short draw that would silently
+change the effective sampling rate and with it the prior correction.
 
 ### `tests/test_calibration.py`
 
-`prior_correct` round-trips on synthetic data: given a known base rate and downsampling
-rate, corrected probabilities recover the true base rate to within Monte-Carlo error; and
-correction is strictly monotone, so AUC is unchanged.
+`prior_correct` round-trips on synthetic data — given a known base rate and downsampling rate,
+corrected probabilities recover the true base rate within Monte-Carlo error — and correction is
+strictly monotone, so AUC is unchanged. `fit_isotonic` is monotone and reduces Brier score on
+held-out data.
 
 ---
 
@@ -1085,19 +1177,16 @@ correction is strictly monotone, so AUC is unchanged.
 | M | Artifact | Test / gate | Metric that must appear |
 |---|---|---|---|
 | **M0** | `uv.lock`, 3 CSVs on disk | `contentsignal --help` runs | — |
-| **M1** | `artifacts/parquet/*`, `01_eda.ipynb` | **`test_leakage.py`, `test_splits.py` green** | Row counts, date range, token-length distribution |
-| **M2** | `artifacts/rows/*` + manifest, tabular features | `test_sampling.py` green; row budget respected (§3.4) | Actual positives/rows per window |
-| **M3** | Arms 1–3 trained | Digest check passes | First `all`-slice AUC/log-loss table |
-| **M4** | Frozen embeddings, taste vectors, arms 4a/4b | `test_leakage.py` still green | Δ(4b − 4a): does personalization help at all |
-| **M5** | Contrastive checkpoints | Collapse check passes | `diag/spearman_pop`, NN dumps |
-| **M6** | Arms 7a/7b + sensitivity | Full grid complete | **All three deltas with 95% CIs, all three slices, plus the H2 delta-of-deltas** |
-| **M6b** | Two-tower arms 9/10 | **`test_twotower.py` green**; collapse + popularity-ρ checks pass | **H3 delta with 95% CI**, plus the log-Q ablation |
-| **M7** | Calibration + business proxy | `test_calibration.py` green | Corrected log-loss, Brier, AOV lift ratio, isotonic recalibration of arms 9/10 |
-| **M8** | Benchmark results | — | Latency table, $/1M, measured `nbytes` |
-| **M9** | `reports/results.md`, `README.md` | `make report` reproduces every number | **The §1 verdict: supported or null** |
+| **M1** | `artifacts/parquet/*`, `01_eda.ipynb` | **`test_splits.py`, `test_leakage.py` green** | Row counts, date range, token-length distribution, cold-start and low-history distributions (which fix both thresholds) |
+| **M2** | Cohort, positives, all 5 feature groups | Deletion-invariance green over `ALL_BUILDERS` | Actual positives and eligible customers per window |
+| **M3** | Retriever checkpoints + item vectors | **`test_retrieval.py` green**; collapse, popularity-ρ, MPS/CPU parity pass | `val recall@100` for `pop`, `R1`, `R2`; log-Q ablation delta |
+| **M4** | Retrieval evaluation | — | **H2: Δ`recall@100` cold-start vs all, with CIs on both and on the difference of deltas**; coverage; the full `K` sweep |
+| **M5** | `artifacts/candidates/*` + manifest, retrieval features | Row budget respected; window-ordering test green | Rows, customers, `recall@K` per candidate window |
+| **M6** | `lgbm`, `mlp`, `dcn` trained | Digest assertion passes on every arm | Ranking **and** end-to-end NDCG@12 / MAP@12, all three slices |
+| **M7** | H3 ablation, calibration, business proxy | `test_calibration.py`, `test_e2e_metrics.py` green | **H3: ΔMAP@12 (hard − random) with CI**; reliability curves; AOV lift ratio |
+| **M8** | Benchmark results | — | Per-stage latency, exact vs FAISS, $/1M, measured `nbytes` |
+| **M9** | `reports/results.md`, `README.md` | `make report` reproduces every number | **H1 stage-attribution table, and the §2 verdict on all three hypotheses: supported or null** |
 
-**M1 gates everything** — no model is trained until the leakage tests pass (PRD §11).
-
-**M9 is the only point at which the test split is read.** M3–M8 report validation-split
-numbers; the test split is evaluated once, at the end, and **all three** §1 pre-registered
-criteria (H1, H2, H3) are applied to that single evaluation.
+**M1 gates everything** — no model is trained until the leakage tests pass. **M3 gates stage 2**
+— if no retriever beats `pop`, that is the finding, and it is cheaper to discover there than at
+M9.

@@ -1,38 +1,94 @@
 # ContentSignal
 
-**A product recommender built ten ways, to measure what product text is actually worth.**
+**A two-stage recommender built to measure where engineering effort actually pays: retrieval or ranking.**
 
-**The task.** Given a customer and a candidate article, predict whether they buy it in the
-next 14 days; rank candidates per customer. Trained on 31.8M H&M transactions across 105k
-articles.
+**The task.** For a customer, select 12 articles from a catalog of 105,000 that they will
+purchase in the next 14 days. Built on 31.8M H&M transactions across 1.37M customers.
 
-**The comparison.** Ten models are trained on the same problem, ranging from a popularity
-heuristic to a **two-tower neural ranker trained end-to-end** over customer purchase history
-and product text. In between sit LightGBM and logistic-regression baselines, and variants
-that add product-text embeddings one layer at a time. Every arm is evaluated on the same
-held-out rows, so the differences are readable.
+**The system.** The production architecture, not a single model. **Stage 1** is a two-tower
+retriever that scores all 105k articles in under a millisecond and returns ~100 candidates.
+**Stage 2** is a ranker — LightGBM, an MLP, and a DCN-v2 — that orders those candidates using
+features too expensive to compute catalog-wide.
 
-**What it measures.** Three things, each pre-registered before any model runs:
+**What it measures.** Three things about how the two stages interact, each pre-registered with a
+stated prior before any model runs:
 
-1. Does product text add ranking signal a tuned gradient-boosted model doesn't already have?
-2. If so, *where* — on established bestsellers, or on cold-start items with no sales history?
-3. What does it cost to serve, in dollars per million predictions?
+1. Is end-to-end quality more sensitive to **retrieval depth** than to **ranker architecture**?
+2. Does product **text** surface cold-start articles that a behavioral retriever structurally
+   cannot?
+3. Does **which negatives you train on** matter more than which model you use?
 
-The reason this is harder than it sounds: most "text" fields in the catalog are the tabular
-taxonomy rendered as strings. An experiment that doesn't account for that measures redundancy
-and reports it as lift.
+The reason these are worth asking: the two stages are usually built and evaluated as independent
+boxes, so the coupling between them — *the ranker can only reorder what retrieval surfaced* —
+goes unmeasured. That coupling is what decides whether the next quarter should go to retrieval or
+to ranking, and it is answerable with numbers rather than intuition.
 
-> ### Status: specification complete, implementation not started
+> ### Status: specification complete; the leakage harness is built, no models trained
 >
-> This repo currently contains **design documents, not code**. The experiment is fully
-> specified — schemas, algorithms, resource budgets, test assertions — and implementation
-> follows milestones M0–M9. **No results are reported below because none exist yet.**
-> The results table is a placeholder and is labelled as one.
+> The experiment is fully specified — schemas, algorithms, resource budgets, test assertions —
+> and implementation follows milestones M0–M9.
+>
+> **Built:** the Python 3.11 environment, the CLI surface, and the invariant spine — temporal
+> windows, the `as_of` cutoff contract, negative sampling, and calibration, with the
+> leakage/splits/sampling/calibration tests green against synthetic fixtures. That harness
+> exists before the data it guards, because M1 gates everything: no model is trained until it
+> passes.
+>
+> **Not built:** ingest, feature builders, the retriever, candidate generation, and all three
+> rankers. **No results are reported below because none exist yet.** The results tables are
+> placeholders and are labelled as such.
 >
 > What's here is the part that determines whether the eventual numbers mean anything.
 
 📄 **[`prd.md`](./prd.md)** — hypotheses, success criteria, and what's out of scope
 📐 **[`trd.md`](./trd.md)** — schemas, module contracts, algorithms, memory budgets, tests
+
+---
+
+## Why two stages
+
+There are 105,000 articles and a slate holds 12. A useful ranking model costs roughly a
+millisecond per (customer, article) pair, so scoring the whole catalog for one customer is ~100
+seconds. That is not a latency budget anyone has, so the work splits:
+
+| | **Stage 1 — retrieval** | **Stage 2 — ranking** |
+|---|---|---|
+| Sees | all 105,000 articles | the ~100 stage 1 returned |
+| Cost per request | must be ~1 ms **total** | can be ~1 ms **per candidate** |
+| Job | *don't miss anything good* | *put the best ones on top* |
+| Failure mode | a good item never enters consideration | good items are ordered badly |
+| Metric | `recall@K` | NDCG@12, MAP@12 |
+
+**`recall@K`** is the fraction of a customer's actual purchases that appear in stage 1's top-`K`
+list. It is the **ceiling on the entire pipeline**: at `recall@100 = 0.60`, 40% of real purchases
+are invisible to stage 2 permanently, and no ranker however sophisticated recovers them. Locating
+that ceiling is the point of the project.
+
+### The two-tower model, and why it is cheap enough for stage 1
+
+One tower turns a customer into 128 numbers, another turns an article into 128 numbers, and the
+score for a pair is their dot product. The load-bearing property is that **the article vector does
+not depend on the customer** — so all 105k are computed once, offline, into a 54 MB table
+(`105,000 × 128 × 4 bytes`). At request time you compute one customer vector and multiply it
+against the whole table:
+
+```
+[1 × 128] · [128 × 105,000]  =  13.4M multiply-accumulate ops  ≈  under 1 ms
+```
+
+If the customer vector depended on which article was being scored — candidate-conditioned
+attention over purchase history, for instance — nothing could be precomputed and retrieval would
+need 105,000 forward passes per request. **`CustomerTower.forward` therefore takes no item
+argument**, and a test asserts it. Candidate-awareness would score better; the accuracy is traded
+for deployability on purpose.
+
+### And why an ANN index is not needed here
+
+That matvec is fast enough at 105k that an approximate-nearest-neighbour index (FAISS, HNSW,
+ScaNN) adds a component without buying latency. ANN earns its complexity somewhere around 10⁷–10⁹
+items. The benchmark runs exact against FAISS anyway and reports both — **demonstrating that a
+standard component is unnecessary at this scale is a result**, and reaching for a vector database
+regardless of catalog size is a common enough reflex to be worth measuring against.
 
 ---
 
@@ -42,185 +98,217 @@ and reports it as lift.
   3 Kaggle CSVs
         │
         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 1. INGEST     CSV → Parquet, narrowed dtypes.                │
-  │               DuckDB streams it; 31.8M rows never in RAM.    │
-  └──────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 1. INGEST     CSV → Parquet, narrowed dtypes.                        │
+  │               DuckDB streams it; 31.8M rows never in RAM.            │
+  └──────────────────────────────────────────────────────────────────────┘
         │
-        ├──────────────────────────────────┐
-        ▼                                  ▼
-  ┌──────────────────────┐   ┌─────────────────────────────────────┐
-  │ 2. WINDOWS           │   │ 5. TEXT ENCODER   (offline track)   │
-  │ 10 × 14 days,        │   │   article text → contrastive        │
-  │ chronological:       │   │   fine-tune on co-purchase pairs    │
-  │ 8 train, 1 val,      │   │        ↓                            │
-  │ 1 test               │   │   encode 105k articles ONCE         │
-  └──────────────────────┘   │   → 162 MB cache (mmap) → SVD-32    │
-        │                    └─────────────────────────────────────┘
-        ▼                                  │
-  ┌──────────────────────┐                 │
-  │ 3. ROW SETS          │                 │
-  │ positives = bought   │                 │
-  │ + 10 sampled negs    │                 │
-  │ written once,        │                 │
-  │ digest-checked       │                 │
-  └──────────────────────┘                 │
-        │                                  │
-        └────────────────┬─────────────────┘
-                         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 4. FEATURE BUILDERS — six groups, per window, every one      │
-  │    gated behind an `as_of` cutoff                            │
-  │    customer · article · categorical · cross                  │
-  │    text_item · text_customer                                 │
-  └──────────────────────────────────────────────────────────────┘
-                         │
-                         ▼
-  ┌──────────────────────────────────────────────────────────────┐
-  │ 6. TEN ARMS                                                  │
-  │    popularity → logreg → LightGBM (baseline)                 │
-  │    + text embeddings, frozen / fine-tuned × item / personal  │
-  │    + TWO-TOWER, trained end-to-end  ← separate training path │
-  └──────────────────────────────────────────────────────────────┘
-                         │
-        ┌────────────────┼────────────────┐
-        ▼                ▼                ▼
-  ┌───────────┐  ┌──────────────┐  ┌──────────────┐
-  │ 7. EVAL   │  │ 8. TRACKING  │  │ 9. BENCHMARK │
-  │ 3 slices, │  │ MLflow +     │  │ latency,     │
-  │ bootstrap │  │ committed    │  │ $/1M preds   │
-  │ CIs       │  │ JSON         │  │              │
-  └───────────┘  └──────────────┘  └──────────────┘
+        ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 2. WINDOWS — ten 14-day windows, and they have ROLES                 │
+  │                                                                      │
+  │   W1 W2 W3 W4  │  W5 W6 W7 W8  │   W9   │  W10                       │
+  │   └─ retriever ┘  └── ranker ──┘   val     test  ← read once         │
+  │       training        training                                       │
+  └──────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 3. STAGE 1 — TWO-TOWER RETRIEVER   (trains on W1–W4 positives only)  │
+  │                                                                      │
+  │   customer tower                     item tower                      │
+  │   ├ last 20 article IDs              ├ 11 taxonomy categoricals      │
+  │   │   → attention pooling            ├ article numerics              │
+  │   ├ customer categoricals            └ detail_desc → MiniLM  ← H2    │
+  │   └ customer numerics                                                │
+  │          └──→ 128-d ──── dot product ──── 128-d ←──┘                 │
+  │                                                                      │
+  │   in-batch sampled softmax + log-Q · then FROZEN                     │
+  └──────────────────────────────────────────────────────────────────────┘
+        │
+        ├──→ encode all 105k articles ONCE → 54 MB mmap'd cache
+        │
+        ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 4. CANDIDATES — top-K per customer for W5–W10, over the full catalog │
+  │    written once, digested. Non-purchases become HARD negatives.      │
+  └──────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 5. FEATURES — five groups, ~47 columns, every one `as_of`-gated      │
+  │    customer · article · categorical · cross · retrieval             │
+  └──────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 6. STAGE 2 — THREE RANKERS on identical candidates                   │
+  │    LightGBM (baseline) · MLP · DCN-v2                                │
+  └──────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  ┌───────────────┐  ┌──────────────┐  ┌──────────────────────────────┐
+  │ 7. EVAL       │  │ 8. TRACKING  │  │ 9. BENCHMARK                 │
+  │ retrieval /   │  │ MLflow +     │  │ per-stage latency, exact vs   │
+  │ ranking / e2e │  │ committed    │  │ FAISS, $/1M predictions       │
+  │ 3 slices, CIs │  │ JSON         │  │                               │
+  └───────────────┘  └──────────────┘  └──────────────────────────────┘
 ```
 
-**Ingest → windows → row sets.** The timeline is cut into ten contiguous 14-day windows. For
-each, the positives are what customers actually bought; ten negatives per positive are
-sampled popularity-weighted. That labelled set is written once and digest-checked, so arms
-can't silently train on different data.
+**Windows have roles because the retriever is itself a trained model.** If it trains on window
+5's purchases and is then asked for window 5's candidates, it has memorized the answer and puts
+it at rank 1 — for a reason that never holds at serving time, when the retriever has never seen
+tomorrow. The ranker would learn to trust rank 1 and collapse in production. So the retriever
+trains on W1–W4 and retrieves for W5–W10, and a test enforces the ordering.
 
-**Feature builders.** Six independent groups, each computed per window behind a required
-`as_of` cutoff. An arm is defined by *which groups it receives* — that's what makes the
-ablation controlled.
+**Stage 1 is the cheap stage.** It trains on positives only — ~260k pairs — because in-batch
+negatives are free: for each real purchase in a batch of 512, the other 511 items serve as its
+wrong answers. That asymmetry is why the retrieval half of question 1 is inexpensive to explore
+and the whole `recall@K` sweep costs a single retrieval pass.
 
-**The text encoder is an offline track, not part of the model.** It fine-tunes MiniLM on
-co-purchase pairs, encodes all 105k articles once into a 162 MB lookup table, and the ranking
-models just read columns from it. This is why fine-tuning is cheap (105k unique strings, not
-5M rows) and why serving cost is near zero.
-
-**The two-tower is the exception** — a customer tower (attention-pooled purchase history) and
-an item tower (text + taxonomy) trained jointly with in-batch sampled softmax. It's the only
-arm with a *learned* customer–item interaction, and the only one that trains its own encoder
-end-to-end rather than consuming the cache.
-
-**Evaluation** runs every metric on three populations — all rows, cold-start articles, and
-low-history customers — with confidence intervals from a customer-level bootstrap.
+**The candidate set is written once and digested.** Every ranker asserts that hash before
+fitting. If ranker A were scored on a different candidate list than ranker B, a ΔNDCG of 0.005
+would be indistinguishable from A having drawn an easier list.
 
 ---
 
-## Pre-registered hypotheses
+## Pre-registered questions
 
-Both fixed before any model runs, so neither result can be rationalized afterward.
+All three fixed before any model runs, judged on the test split, which is read **once**. All
+confidence intervals come from 1000 bootstrap resamples over **customers**, not rows.
 
-**H1 — magnitude.** Fine-tuned text embeddings improve ranking quality over a tuned
-LightGBM baseline on an identical temporal test split.
+### H1 — Stage attribution *(the headline)*
 
-```
-ΔAUC ≥ 0.005   AND   95% bootstrap CI on ΔAUC excludes zero
-```
+> End-to-end quality is more sensitive to retrieval depth than to ranker architecture.
 
-**H2 — direction.** The lift concentrates in cold-start articles, where popularity features
-are near zero and the description is complete from day one.
+**Supported** if ΔMAP@12 from `K` = 100 → 500 exceeds ΔMAP@12 from the worst to the best ranker at
+fixed `K`, with the 95% CI on the difference of deltas excluding zero.
+**Registered prior: supported.**
 
-```
-ΔAUC(cold-start) > ΔAUC(all)   AND   95% CI on the difference of deltas excludes zero
-```
+The deliverable is a stage-attribution table putting every intervention on one axis — Δquality,
+Δp95 latency, Δ$/1M — which is what makes retrieval and ranking commensurable at all.
 
-H2 is the claim worth making. "Text helps" is diffuse; "text helps precisely where
-behavioral signal is missing" names a deployment condition. **H1 and H2 are independent** —
-H1 can fail while H2 holds, and that combination is the more useful outcome.
+### H2 — Content-based retrieval and cold start
 
-**H3 — architecture.** The end-to-end two-tower beats the staged pipeline (contrastive
-pre-train → freeze → LightGBM).
+> Adding the free-text description to the item tower improves recall more on cold-start articles
+> than on articles overall.
 
-```
-ΔAUC ≥ 0.005   AND   95% bootstrap CI excludes zero        (arm 10 − arm 7b)
-```
+**Supported** if Δ`recall@100` on cold-start ≥ 0.01 with CI excluding zero, **and** it exceeds
+Δ`recall@100` on all articles with the CI on that difference excluding zero.
+**Registered prior: supported on cold-start, marginal or null on aggregate.**
 
-> **Registered prior: I expect H3 to fail on aggregate.** Gradient-boosted trees usually beat
-> neural rankers on tabular-dominant problems at this scale. Writing that down beforehand is
-> what makes either outcome informative — and the interesting case is H3 failing on all rows
-> while holding on cold-start, where the text pathway matters most.
+The mechanism is concrete. An article added today has zero popularity, zero purchase history, and
+a complete description:
 
-Anything less, on any of the three, is a null result — and **a null gets published as the headline
-finding**, with the same prominence a positive would get. No re-tuning, no re-cutting
-splits, no swapping metrics until something clears the bar. The test split is read exactly
-once, at the end.
+| Signal | Available on day one? |
+|---|---|
+| Popularity, purchase counts, distinct buyers | **no** |
+| Co-purchase history | **no** |
+| Taxonomy | yes |
+| `detail_desc` | **yes, in full** |
 
-A repo that can only produce good news isn't measuring anything.
+A behavioral retriever scores it ≈0 → never in the top 100 → **the ranker never sees it** → it can
+never be recommended, no matter how good the ranker is. A content retriever can place it near
+similar items. This is a chicken-and-egg loop — a new product can't accumulate purchases because
+it isn't shown, and isn't shown because it has no purchases — and content-based retrieval is how
+it breaks.
+
+### H3 — Candidate distribution shift
+
+> A ranker trained on random negatives underperforms end-to-end against the identical ranker
+> trained on the retriever's hard negatives.
+
+**Supported** if ΔMAP@12 ≥ 0.005 end-to-end with CI excluding zero.
+**Registered prior: supported, and larger than the ranker-architecture delta in H1** — i.e. *what
+you train on matters more than which model you use.*
+
+At serving time a ranker only ever sees stage 1's output. Training it on random popular articles
+(easy to reject) and serving it plausible retrieved ones (hard) is a documented failure mode —
+sample selection bias in candidate generation — that produces models which test well and
+disappoint in production.
+
+### A null result is pre-committed
+
+If a hypothesis misses its bar, that is the headline finding, reported with the same prominence a
+positive would receive. No arm is re-tuned, no split re-cut, no threshold moved, no metric
+swapped. The three are independent: H1 can hold while H2 fails, and each combination is a
+different useful finding.
 
 ---
 
 ## Design decisions
 
-Every row is a place where two defensible options existed. Reasons are mechanisms or
-numbers, never preferences. Full derivations in [`trd.md`](./trd.md).
+Every row is a place where two defensible options existed. Reasons are mechanisms or numbers,
+never preferences. Full derivations in [`trd.md`](./trd.md).
 
 | Decision | Considered | Chosen | Reason |
 |---|---|---|---|
-| **Text → GBDT dimensionality** | raw 384 / SVD-32 / SVD-64 | **SVD-32** | 384 dense low-variance dims degrade axis-aligned splits and cost 1.6 GB vs 400 MB binned at 5M rows. 64 and 384 run as sensitivity, not as the grid |
-| **Fine-tune objective** | pointwise item-rate / contrastive co-purchase | **contrastive** | An item-rate target ≈ article popularity, which the baseline already holds *measured exactly*. The encoder would learn a lossy copy of an existing feature, and the resulting null would be an artifact of the objective rather than a fact about text |
-| **Personalization** | item-side embeddings only / taste-vector cosine / learned two-tower | **taste-vector cosine** | Item-side dims are constant per customer and cannot reorder a per-customer ranking. A two-tower would likely win outright, but confounds the encoder's marginal contribution — which is the quantity being measured |
-| **Negative sampling ratio** | 1:1 / 1:10 / 1:50 | **1:10, fixed across arms** | Trades compute against calibration. AUC is sampling-invariant; log-loss is not, so log-loss is prior-corrected and reported both ways |
-| **Baseline feature set** | text fields to the encoder only / all 11 categoricals to the baseline | **all 11 to the baseline** | Otherwise the encoder is credited with information the baseline was denied. This is the difference between measuring lift and manufacturing it |
-| **Hyperparameter budget** | tune each arm / tune baseline once, then freeze | **freeze** | Per-arm tuning confounds "better features" with "more tuning budget" |
-| **Bootstrap resampling unit** | rows / customers | **customers** | Rows within a customer share history features and basket composition. Row-level CIs are narrow enough for noise to clear the ΔAUC ≥ 0.005 bar |
+| **Architecture** | single-stage scoring of a sampled candidate set / two-stage retrieval + ranking | **two-stage** | Single-stage cannot ask where the pipeline's ceiling is, because it never generates candidates. The coupling between stages is the quantity worth measuring |
+| **History attention** | candidate-aware / self-attentive with learned query | **self-attentive** | Candidate-aware scores better but makes the customer vector depend on the item, so neither tower is precomputable — it breaks retrieval outright and voids the cost analysis. Accuracy traded for deployability, deliberately |
+| **Item tower inputs** | + learned 105k × 64 article-ID embedding / content-only | **content-only** | An ID vector for a newly added article is untrained noise. ID towers are stronger on the head; content towers are the only ones that function on new items — which is the exact mechanism H2 tests |
+| **Retrieval search** | FAISS IVF index / exact matvec | **exact**, with FAISS benchmarked | 105k × 128 is 13.4M MACs, under a millisecond. An index at this scale is infrastructure without a latency payoff. Measured rather than assumed |
+| **Stage-1 objective** | BCE on materialized negatives / in-batch sampled softmax | **sampled softmax** | The standard retrieval formulation, and it trains on positives only (~260k pairs) because in-batch negatives are free — making stage 1 cheaper than any ranker |
+| **In-batch negative bias** | raw softmax / log-Q correction | **log-Q** | In-batch negatives arrive ∝ popularity, rewarding the model for demoting popular items until it inverts popularity. `logits −= log P(sample item)` corrects it (Yi et al., RecSys 2019). Run once without it to demonstrate the effect rather than assert it |
+| **Retriever/ranker temporal split** | one retriever on all 8 train windows / per-window time-sliced retrievers / 4 + 4 role split | **4 + 4** | Training on windows you retrieve for memorizes the labels. Time-slicing is faithful but costs 8× stage-1 training and 8 candidate artifact sets on an 8 GB machine. Cost of 4+4: the retriever is 12 weeks stale at test — realistic, equal across arms, and reported |
+| **Stage-2 candidate set** | regenerate per arm / write once and digest | **write once** | A ΔNDCG of 0.005 must not be attributable to one arm receiving an easier list |
+| **Stage-2 negatives** | random popularity-weighted / retriever's top-K non-purchases | **retriever's**, with random as the H3 arm | Train/serve consistency: the ranker only ever sees stage 1's output. The gap between the two is H3, measured rather than asserted |
+| **Ranker architectures** | MLP only / MLP + DCN-v2 / + LightGBM baseline | **all three** | Claiming a neural ranker on a tabular-dominant problem without checking gradient-boosted trees credits the architecture for a result nobody verified. `dcn` vs `mlp` isolates learned crossing against the six hand-written crosses |
+| **Customer–item similarity features** | hand-built taste vector + `sim_taste_cos` / none | **none** | Those exist because *trees cannot compute a dot product* between a taste vector and an item vector. A two-tower computes exactly that, learned end-to-end. Keeping both would duplicate stage 1's job less well |
+| **Baseline feature set** | text fields to the encoder only / all 11 categoricals to every arm | **all 11 to every arm** | Otherwise the encoder is credited with information the baseline was denied. This is the difference between measuring lift and manufacturing it |
+| **Hyperparameter budget** | tune each arm / tune `lgbm` once, then freeze | **freeze** | Per-arm tuning confounds "better architecture" with "more tuning budget," and the delta then measures effort |
+| **Bootstrap resampling unit** | rows / customers | **customers** | Rows within a customer share history features and basket composition. Row-level CIs are narrow enough for noise to clear any significance bar |
+| **Calibration** | parametric prior correction / isotonic on validation | **isotonic**, prior correction for the H3 arm | Retrieval-induced sampling has no fixed downsampling rate `w` — how many negatives a customer gets depends on what was retrieved. The H3 arm has a genuine `w`, so both paths run there as a cross-check |
 | **Data engine** | pandas / Polars + DuckDB | **Polars + DuckDB** | 31.8M rows do not fit in pandas at 8 GB; aggregation runs out-of-core |
-| **`max_bin`** | 255 (default) / 63 | **63** | 400 MB binned vs 1.6 GB raw at 5M × 80. A feasibility requirement, not a tuning choice |
-| **Serving path** | online forward pass / offline embedding cache | **offline cache** | 105k × 384 × 4 B ≈ 162 MB. The catalog fits in memory, so the transformer never runs at request time except for new items |
-| **Two-tower objective** | BCE on the shared 1:10 rows / in-batch sampled softmax | **sampled softmax** | The standard retrieval formulation, and it trains on positives only (~520k, not 5.7M rows) so it is *cheaper* than the GBDT arms. Cost: a different negative distribution, so the 10 − 7b delta covers architecture *and* objective — stated, not hidden |
-| **In-batch negative bias** | raw softmax / log-Q correction | **log-Q** | In-batch negatives are drawn ∝ popularity, rewarding the model for demoting popular items. `logits −= log P(sample item)` corrects it (Yi et al., RecSys 2019). Run once without it to demonstrate the effect rather than assert it |
-| **History attention** | candidate-aware / self-attentive with learned query | **self-attentive** | Candidate-aware attention scores better but makes the customer vector depend on the item, so neither tower is precomputable — it breaks retrieval and voids the serving-cost analysis. Accuracy traded for deployability, deliberately |
+| **`max_bin`** | 255 (default) / 63 | **63** | 235 MB binned vs 940 MB raw at 5M × 47. A feasibility requirement, not a tuning choice |
+| **Serving path** | online forward pass / offline vector cache | **offline cache** | 105k × 128 × 4 B ≈ 54 MB. The catalog fits in memory, so the transformer never runs at request time except for genuinely new articles |
+| **Row budget** | fix the cohort size / fix a row target and measure | **measure** | Ranker rows scale as `windows × customers × K`; the estimate has real uncertainty. `retrieve` fails loudly naming the cap that fits, rather than OOMing mid-grid |
 
 ---
 
-## Two ways this experiment gets rigged — and how each is closed
+## Three ways this experiment gets rigged — and how each is closed
 
-The rows above are judgment calls. These two are validity failures: setups that produce a
+The rows above are judgment calls. These three are validity failures: setups that produce a
 headline number which looks great and means nothing.
 
-### 1. Build a text feature that structurally cannot help
+### 1. Let the ranker take credit for what retrieval never surfaced
 
-The obvious design joins article embeddings into the feature table as 32 columns. Those
-columns hold **the same value for every customer** — and a feature constant across customers
-*cannot reorder items differently per customer*. For `precision@k` and `MAP@12`, which are
-per-customer rankings, item-side text contributes almost nothing beyond what popularity
-already contributes.
+Compute MAP@12 over the retrieved candidates and it looks excellent — because every positive
+stage 1 missed has silently left the denominator. The metric is inflated by exactly the
+retriever's miss rate, and **nothing in the output looks wrong.** This is the most likely silent
+error in any two-stage evaluation.
 
-That design yields a null result regardless of whether product semantics carry signal. The
-finding would be a fact about the architecture, not about text — and it would be reported as
-the latter.
+**Closed by** computing end-to-end metrics over *every* positive in the window, retrieved or not.
+Unretrieved positives count as misses. The consequence is hand-checkable:
 
-**Closed by** putting the customer on both sides:
+> **End-to-end MAP@12 must be strictly below ranking-only MAP@12 for every arm.**
+> If they are equal, the accounting is broken and every headline number is inflated.
 
-- a **taste vector** — the mean embedding of what the customer bought before the cutoff —
-  plus `cosine(taste, candidate)` and similarity to their 10 most recent purchases
-- **contrastive co-purchase fine-tuning** — positive pairs are two articles bought by the
-  *same* customer, so the encoder learns a space where *products that appeal to the same
-  person sit close together*
+### 2. Let the retriever see the window it retrieves for
 
-The encoder never reads a customer column. Customer information enters through *which pairs
-are positives*. Pair sampling is capped at 5 per customer and 50 per article — uncapped, it
-is dominated by heavy buyers and bestsellers, which pushes the encoder straight back toward
-the popularity proxy the contrastive objective exists to avoid.
+Train the retriever on all eight train windows — the obvious default — and it will have memorized
+that this customer bought this article in window 5, so it ranks it first. The ranker then trains
+on candidate lists where the answer is reliably at the top, for a reason that will never hold in
+production.
 
-### 2. Let the future leak backward
+**Closed by** giving windows roles: the retriever trains on W1–W4 only and retrieves for W5–W10.
+Asserted directly:
 
-Item popularity computed over the full dataset is one line of code, works extremely well,
-and contains the future.
+```python
+# every retriever training window must end before the first window it retrieves for
+assert max(w.end for w in windows_for_role("retriever")) < min(
+    w.start for w in candidate_windows()
+)
+```
 
-**Closed by** making the leak unwritable rather than merely discouraged. Every feature
-builder takes `as_of` as a **required keyword-only argument** and reads transactions only
-through a single gated helper. The property test is general:
+### 3. Let the future leak backward into a feature
+
+Item popularity computed over the full dataset is one line of code, works extremely well, and
+contains the future.
+
+**Closed by** making the leak unwritable rather than merely discouraged. Every feature builder
+takes `as_of` as a **required keyword-only argument**, verified at import time, and reads
+transactions only through a single gated helper. The property test is general and applies
+automatically to every registered builder:
 
 ```python
 # recompute the feature on data truncated at the window start.
@@ -238,149 +326,178 @@ assert_frame_equal(
 ## Method
 
 **Data** — [H&M Personalized Fashion Recommendations](https://www.kaggle.com/competitions/h-and-m-personalized-fashion-recommendations):
-31.8M transactions, 105k articles, 1.37M customers, Sept 2018 → Sept 2020.
+31.8M transactions, 105k articles, 1.37M customers, Sept 2018 → Sept 2020. The ~30 GB image set
+is not used.
 
-**Splits** — ten contiguous 14-day windows: 8 train, 1 validation, 1 test. Strictly
-chronological, never shuffled. Features for a window read only data strictly before it.
+**Label** — purchase, not click or add-to-cart. The dataset contains purchase transactions only;
+no impression logs or funnel events exist anywhere in the release, so any other framing would
+describe an experiment this data cannot support.
 
-**Negatives** — implicit feedback has no true negatives. Sampled popularity-weighted at
-`pop^0.75`, since uniform negatives are trivially separable and inflate AUC. The sampled row
-set is written once, digested, and **reused byte-identically by arms 1–8** — without that,
-a ΔAUC of 0.005 is indistinguishable from a different random draw.
+**Splits** — ten contiguous 14-day windows with roles: 4 retriever-training, 4 ranker-training,
+1 validation, 1 test. Strictly chronological, never shuffled. Features for a window read only
+data strictly before it starts.
 
-The two-tower arms are the bounded exception: they train on in-batch softmax negatives, then
-are **evaluated on the identical test rows**, so ranking metrics stay comparable while
-probability metrics require isotonic recalibration on validation.
+**Product text** — every article has structured category columns *and* a free-text description:
 
-**Text variants** — run separately, because they measure different things:
+| Column | Value |
+|---|---|
+| `product_type_name` | Vest top |
+| `colour_group_name` | Black |
+| `index_name` | Ladieswear |
+| **`detail_desc`** | **"Jersey top with narrow shoulder straps."** |
+
+The categories are already usable by any model. `detail_desc` is the one column nothing can use,
+because models don't take sentences — so it gets dropped. H2 asks whether that's a mistake. It
+isn't trivially one: two articles can share identical taxonomy and differ entirely in description.
+
+Two variants run, because they measure different things:
 
 | | Content | Reads as |
 |---|---|---|
-| **Text-A** | full concat: name + type + group + colour + department + `detail_desc` | Optimistic bound. Overlaps the taxonomy the baseline already has, so part of any lift is re-encoded categoricals |
-| **Text-B** | `detail_desc` only | The honest measure. The one field with no categorical twin, so lift here is genuinely novel information |
+| **Text-B** *(default)* | `detail_desc` only | The honest measure. The one field with no categorical twin, so lift here is genuinely novel information |
+| **Text-A** *(one sensitivity run)* | full concat: name + type + group + colour + department + `detail_desc` | Optimistic bound. Overlaps the taxonomy every arm already has, so part of any lift is re-encoded categoricals |
 
 Reporting both quantifies how much apparent "text lift" is taxonomy in disguise.
 
-**Arms** — baselines, then a 2×2 over the text arms, then the neural rankers:
-
-| # | Arm | Embeddings | Text form |
-|---|---|---|---|
-| 1 | Popularity ranker | — | — |
-| 2 | Logistic regression | — | — |
-| 3 | **LightGBM (baseline)** | — | — |
-| 4a | LightGBM + frozen | pretrained | item-side |
-| 4b | LightGBM + frozen | pretrained | item + personalized |
-| 7a | LightGBM + fine-tuned | contrastive | item-side |
-| 7b | **LightGBM + fine-tuned** | contrastive | item + personalized |
-| 8 | Text-only encoder | contrastive | — |
-| 9 | Two-tower | frozen | learned towers |
-| 10 | **Two-tower, end-to-end** | trained jointly | learned towers |
-
-Arms 4a/4b/7a/7b form a clean 2×2 — *frozen vs fine-tuned* crossed with *item-side vs
-personalized* — which is what makes any win interpretable. With only "baseline vs best" you
-cannot tell whether fine-tuning or personalization produced it.
-
-| Delta | Isolates |
-|---|---|
-| 7b − 3 | **H1.** Total lift from product content |
-| 7b − 7a | Personalization — the taste vector and similarity features |
-| 7b − 4b | Fine-tuning — if ≈ 0, an off-the-shelf encoder sufficed |
-| 10 − 7b | **H3.** End-to-end learned interaction vs the staged pipeline |
-| 10 − 9 | What end-to-end encoder training adds inside the tower architecture |
-| 9 − 3 | Whether a neural ranker beats GBDT here at all |
-
-**Slices** — every metric on three populations: all rows, **cold-start articles**, and
-low-history customers. Cold start is where text should win if it wins anywhere: a new
-article has no popularity signal but has a description from day one.
+**Slices** — every metric on three populations, because the aggregate hides the part that
+matters: all rows, **cold-start articles** (`art_prior_purchases < 10`), and low-history
+customers. Both thresholds are set once at M1 from the measured distributions and registered —
+retuning a slice boundary after seeing results is p-hacking with extra steps.
 
 ---
 
 ## Results
 
-**Not yet run.** This table is a placeholder; `make report` will generate it from
-committed per-run JSON so no number here is ever hand-typed.
+> **Placeholder.** No models have been trained. Every cell is regenerated by `make report` from
+> git-committed per-run JSON — **no number in this file is ever hand-typed.**
 
-| Arm | AUC | Log-loss | precision@10 | MAP@12 |
+### Stage-attribution table (H1)
+
+| Intervention | ΔMAP@12 (e2e) | 95% CI | Δp95 ms | Δ$/1M | Δ quality per ms |
+|---|---|---|---|---|---|
+| `K` 100 → 200 | — | — | — | — | — |
+| `K` 100 → 500 | — | — | — | — | — |
+| text in retriever (`R1` → `R2`) | — | — | — | — | — |
+| `lgbm` → `mlp` | — | — | — | — | — |
+| `lgbm` → `dcn` | — | — | — | — | — |
+| random → hard negatives | — | — | — | — | — |
+
+### Retrieval (H2)
+
+| Arm | `recall@100` all | `recall@100` cold-start | Coverage | Popularity ρ |
 |---|---|---|---|---|
-| Popularity | — | — | — | — |
-| LightGBM (tabular) | — | — | — | — |
-| + fine-tuned text | — | — | — | — |
-| Two-tower, end-to-end | — | — | — | — |
-| **H1 · Δ (95% CI)** | — | — | — | — |
-| **H3 · Δ (95% CI)** | — | — | — | — |
+| `pop` (floor) | — | — | — | — |
+| `R1` no text | — | — | — | — |
+| `R2` + `detail_desc` | — | — | — | — |
+
+### Ranking and end-to-end
+
+| Arm | AUC | NDCG@12 | MAP@12 | **MAP@12 (e2e)** |
+|---|---|---|---|---|
+| `lgbm` | — | — | — | — |
+| `mlp` | — | — | — | — |
+| `dcn` | — | — | — | — |
 
 ---
 
 ## Cost
 
-An accuracy result nobody can afford to serve isn't a result. Per 1K predictions, measured:
-LightGBM alone, LightGBM + cached embeddings, and the encoder cold path on MPS, CPU, and
-ONNX-int8 — converted to $/1M predictions against a named cloud SKU.
+Measured per stage on the target machine, so the latency budget is attributable rather than one
+opaque number. Converted to **$/1M predictions** against one named cloud SKU, with instance type
+and price-lookup date cited inline.
 
-The claim under test: **105k × 384 × 4 B ≈ 162 MB** (~40 MB int8). The entire catalog fits
-in memory, so the encoder is an offline batch job feeding a lookup table, not an online
-forward pass — steady-state cost near zero, with the cold path mattering only for new
-articles. The benchmark prints measured RSS alongside the latency table so this is evidence,
-not arithmetic.
+The claim to confirm:
+
+```
+105,000 × 128 × 4 B  ≈   54 MB    item vectors, fp32
+105,000 × 384 × 4 B  ≈  162 MB    raw encoder output, fp32
+105,000 × 384 × 1 B  ≈   40 MB    int8
+```
+
+If those hold, **the transformer's steady-state serving cost is approximately zero** — it is an
+offline batch job feeding a lookup table, not an online forward pass. The cold path matters only
+for genuinely new articles, a small and predictable trickle.
+
+That reframes the standard "transformers are too expensive to serve" objection honestly: for an
+item-level-text problem with a bounded catalog, the expensive thing amortizes to near-nothing.
+Whether it changes the *conclusion* depends entirely on whether there was any lift to serve.
+
+`bench` prints the cache's measured `nbytes` and `peak_rss_mb` alongside the latency table, so
+the memory claim is evidence rather than arithmetic.
 
 ---
 
 ## Engineering constraints
 
-Everything runs on a **laptop: 8 GB RAM, 8 cores, Apple Silicon, no discrete GPU.** That
-drives real design decisions:
+8 GB RAM, 8 cores, Apple Silicon, MPS only. This drives design, not just caution.
 
-- **DuckDB for aggregation, Polars for frames.** 31.8M rows don't fit in pandas here.
-- **`max_bin=63` is a memory requirement, not a tuning choice** — it takes the training
-  matrix from 1.6 GB raw to 400 MB binned, which is what makes LightGBM fit.
-- **Fine-tuning batches deduplicated article *pairs*, not rows.** 105k unique texts against
-  ~5M rows means naive batching re-encodes every string ~38× per epoch. The contrastive
-  formulation makes each example a pair of texts: ~6–10 minutes per epoch instead of hours.
-- **A row budget, not a cohort size, is the binding constraint.** The sampler measures actual
-  counts and fails loudly with the cohort size that would fit — discovering the memory
-  ceiling midway through a 48-run ablation grid is expensive.
+| Stage | Peak RSS | How it stays bounded |
+|---|---|---|
+| `ingest` | ~1.5 GB | DuckDB streams CSV → Parquet; 31.8M rows never materialize |
+| `train-retriever` | ~3.0 GB | ~30M params × 4 B × 4 Adam states ≈ 480 MB, plus activations for batch 512 with ~450 unique texts |
+| `retrieve` | ~1.0 GB | 54 MB mmap'd index; customers chunked at 4096, score blocks tiled |
+| `train-ranker` (`lgbm`) | ~2.0 GB | `max_bin=63` → 235 MB binned vs 940 MB raw at 5M × 47 |
+| `train-ranker` (`mlp`/`dcn`) | ~1.5 GB | ~400k params; minibatches streamed from Parquet, design matrix never materialized |
 
-Per-stage memory budgets are specified in [`trd.md` §14](./trd.md) against a 6.5 GB usable
-ceiling, before any code was written.
+Two consequences worth noting. Dropping the 32 embedding feature columns took the LightGBM matrix
+from 80 to 47 columns and its peak from 3.5 GB to 2.0 GB — the two-tower subsumed those features,
+so the memory came back for free. And the rankers are *tiny* (~400k params): at this scale memory
+is dominated by the data, not the model.
 
 ---
 
 ## Limitations
 
-Stated because they bound what the results can claim:
+Stated here rather than discovered later.
 
-- **The label is purchase, not click or add-to-cart.** H&M ships purchase transactions only —
-  no impression logs, no funnel steps. Calling this engagement prediction would describe an
-  experiment this data can't support.
-- **`price` is scaled and anonymized, not currency.** Every revenue figure is a relative lift
-  ratio. There is no honest way to report AOV in dollars here.
-- **Results are conditional on the customer transacting.** Rows exist only for customers with
-  a purchase in the window — necessary for per-customer ranking metrics to be defined, but a
-  real selection effect.
-- **The two-tower delta is not a clean isolation.** Arms 9 and 10 differ from the staged
-  pipeline in both architecture *and* training objective (sampled softmax vs the shared 1:10
-  rows). The H3 number covers both; it cannot be split into "neural helped" and "objective
-  helped" within this design.
-- **No candidate-aware interaction.** Both towers must stay independently precomputable or
-  the serving-cost analysis stops describing a deployable system, so cross-attention and
-  DLRM-style feature crossing are out of scope.
+- **The retriever is 12 weeks stale at the test window.** One retriever trained on W1–W4 serves
+  W5–W10. Realistic — production retrieval models retrain on a cadence — and it hits every arm
+  equally, so comparisons hold. Fashion is seasonal, so the decay may be larger here than
+  elsewhere; the `recall@K` curve from W5 to W10 *is* the decay estimate and is reported.
+- **Rows exist only for customers who transacted in the window.** Every number is conditional on
+  the customer transacting and does not describe the full customer base.
+- **The stage-2 axis is "the ranker's own features," not "a text-free pipeline."** Text reaches
+  every ranker through `retrieval_score`, because the frozen retriever is text-aware. The clean
+  pipeline-level number is H2's end-to-end comparison.
+- **`price` is scaled and anonymized.** All revenue figures are relative ratios. This project
+  cannot and does not report AOV in currency.
+- **No online evaluation.** No live traffic exists; all business metrics are offline proxies and
+  labelled as such.
+- **MAP@12 is reported for calibration against the public leaderboard, not as a target.**
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| **`recall@K`** | Fraction of a customer's actual purchases appearing in stage 1's top `K`. The pipeline's ceiling |
+| **NDCG@12 / MAP@12** | Ranking-quality metrics over a 12-slot slate, computed per customer then averaged. MAP@12 is H&M's native competition metric |
+| **Two-tower** | Customer → 128 numbers, article → 128 numbers, score = dot product. Item vectors precompute because they don't depend on the customer |
+| **Hard negatives** | Wrong answers drawn from what the retriever actually returned — plausible items the customer didn't buy. Contrast with random negatives, which are trivially separable |
+| **In-batch softmax** | For each real purchase in a batch of 512, the other 511 items serve as its negatives. Free negatives, no materialized rows |
+| **log-Q correction** | Subtracts each item's log sampling frequency from its logit. Without it, popular items appear as negatives more often and the model learns to rank popularity backwards |
+| **DCN-v2** | A ranker with layers that explicitly multiply feature pairs, so it discovers interactions like `age × category` without them being hand-written |
+| **`as_of`** | The exclusive cutoff for a window. Features may read `t_dat < as_of`, never `>=`. Required keyword-only on every feature builder |
+| **Cold-start article** | Fewer than 10 purchases before the window starts. Popularity features are ≈0; the description is complete |
+| **Isotonic calibration** | A monotone step function fit on validation that maps a raw model score to an observed purchase rate. Needed before a prediction can be multiplied by price |
+| **Digest** | SHA-256 of an artifact's bytes, recorded in a manifest and asserted before training, so no arm can silently train on different data |
 
 ---
 
 ## Running it
 
-The CLI is specified in [`trd.md` §13](./trd.md) but **not yet implemented**:
-
 ```bash
-uv sync                                    # Python 3.11
-contentsignal ingest                       # Kaggle CSVs → parquet
-contentsignal sample                       # temporal windows + negative sampling
-contentsignal build-features --group ...
-contentsignal finetune --variant b            # contrastive encoder fine-tune
-contentsignal train --arm lgbm_ft_pers --variant b --seed 1
-contentsignal train-twotower --arm 10 --variant b --seed 1
-contentsignal report                       # regenerates the results table
-pytest tests/test_leakage.py               # the gate on everything downstream
+uv sync                                  # Python 3.11; system 3.9 cannot be used
+uv run pytest                            # the invariant harness — green before any data exists
+uv run contentsignal splits              # print the window table with roles
+uv run contentsignal --help
 ```
 
-Requires accepting the H&M competition rules on Kaggle and placing `kaggle.json`.
+`make m1` … `make m9` chain the pipeline to match milestones. Every command is idempotent and
+skips work when its outputs exist with a matching config hash, unless `--force`.
+
+**Data access requires two manual steps** — accept the competition rules on Kaggle, and place
+`kaggle.json` at `~/.kaggle/` with mode `600`. The API returns 403 until the rules are accepted,
+even with a valid token, so `ingest` checks both and names them separately before starting a
+multi-GB download.

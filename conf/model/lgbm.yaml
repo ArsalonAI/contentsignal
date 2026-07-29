@@ -1,0 +1,38 @@
+# Stage 2 — LightGBM, the tabular baseline (trd.md §9b.1).
+#
+# THIS IS THE ONLY ARM THAT GETS TUNED. `mlp` and `dcn` inherit these settings where they
+# apply and are otherwise frozen. Tuning each arm separately would confound "better
+# architecture" with "more tuning budget," and the resulting delta would measure effort
+# rather than design (trd.md §9b.4).
+#
+# Keeping a GBDT baseline is not ceremony: trees usually win on tabular-dominant problems
+# at this data scale, and claiming a neural ranker without checking them would credit the
+# architecture for a result nobody verified.
+
+objective: binary
+metric: [auc, binary_logloss]
+
+num_leaves: 127
+learning_rate: 0.05
+n_estimators: 2000
+early_stopping_rounds: 100        # on the val window
+
+feature_fraction: 0.8
+bagging_fraction: 0.8
+bagging_freq: 1
+min_data_in_leaf: 100
+
+# max_bin=63 is NOT a tuning choice — it is what makes the run fit in 8 GB.
+# At 5M rows x 47 columns: 940 MB raw float32 vs 235 MB binned to uint8 (trd.md §14).
+max_bin: 63
+
+num_threads: 7                    # 8 cores, one left for the OS
+verbosity: -1
+seeds: [1, 2, 3]
+
+# All eleven taxonomy columns are passed as native categoricals. Every arm receives all
+# eleven — withholding them from a baseline while feeding the same information to the
+# encoder as text credits the encoder with information the baseline never had, which is
+# the most common way this class of experiment is run wrong (prd.md §3).
+categorical_features: native
+free_raw_data: true               # after Dataset.construct(), to drop the raw matrix

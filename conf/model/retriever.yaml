@@ -1,0 +1,62 @@
+# Stage 1 — the two-tower retriever (trd.md §5.3, §9).
+
+towers:
+  out_dim: 128                    # both towers; L2-normalized, score = dot product
+  mlp_hidden: [512, 256]
+  activation: gelu
+  dropout: 0.1
+  cat_embed_dim_min: 8
+  cat_embed_dim_max: 16
+  temperature_init: 0.05          # learned scalar
+
+customer_tower:
+  # The item-ID table here is for HISTORY, where every ID is an article with prior
+  # purchases by definition.
+  item_id_dim: 64
+  hist_len: 20                    # last 20 purchases, right-padded and masked
+
+  # Self-attentive pooling with a learned query: softmax(q^T tanh(W h)) . h
+  #
+  # NOT candidate-aware. Conditioning the attention on the candidate article would score
+  # better, but the customer vector would then depend on the item and neither tower could
+  # be precomputed — which breaks retrieval outright and voids the cost analysis.
+  # `CustomerTower.forward` takes no item argument, and a test asserts it.
+  pooling: self_attentive
+
+item_tower:
+  # No article-ID embedding. A newly added article's ID vector would be untrained noise;
+  # a content-only tower can represent an article with zero purchase history. ID towers
+  # are stronger on the head of the distribution — this is a deliberate trade, and it is
+  # the mechanism H2 tests (prd.md §6).
+  use_item_id_embedding: false
+
+encoder:
+  # Chosen to fit MPS on 8 GB with headroom. Trains jointly with the towers.
+  name: sentence-transformers/all-MiniLM-L6-v2
+  max_seq_len: 64                 # product text is short; the EDA justifies the number
+  out_dim: 384
+
+training:
+  objective: sampled_softmax      # in-batch; batch size IS the negative count
+  logq_correction: true           # Yi et al., RecSys 2019 — see below
+  batch_size: 512
+  epochs: 2
+  select_on: recall_at_100        # on the val window
+  lr_towers: 1.0e-3               # discriminative: fresh towers learn fast
+  lr_encoder: 2.0e-5              # pretrained weights move slowly
+  warmup_frac: 0.1
+  schedule: cosine
+  weight_decay: 0.01
+  device: mps                     # --device cpu fallback is tested
+  seeds: [1, 2, 3]
+
+  # Uncapped pair sampling is dominated by heavy buyers and bestsellers, which pushes the
+  # encoder back toward a popularity proxy — the same contamination log-Q guards against,
+  # arriving by a different route. The popularity-rho diagnostic checks both worked.
+  max_pairs_per_customer: 5
+  max_pairs_per_article: 50
+
+# Without the log-Q term, in-batch negatives arrive proportional to item popularity, so the
+# model is rewarded for demoting popular items and drifts toward an INVERTED popularity
+# ranker. `logits -= log P(sample item)` cancels it. One run with
+# `--no-logq` demonstrates the effect rather than asserting it (trd.md §9.5).
