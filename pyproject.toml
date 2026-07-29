@@ -22,6 +22,7 @@ dependencies = [
   "pyyaml>=6.0",
   "typer>=0.12",           # CLI
   "scipy>=1.13",           # spearmanr, alias sampling support
+  "kaggle>=1.6",           # the fresh-clone download path only; ingest reads data/ if present
 ]
 
 [project.optional-dependencies]
@@ -69,6 +70,7 @@ strict = true
 [[tool.mypy.overrides]]
 module = [
   "duckdb.*",
+  "kaggle.*",
   "lightgbm.*",
   "mlflow.*",
   "scipy.*",

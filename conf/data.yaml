@@ -1,7 +1,7 @@
 # Paths, cohort, candidate generation, and negative sampling (trd.md §3.2, §3.4, §8).
 
 paths:
-  raw: data                       # Kaggle CSVs; deleted after parquet conversion
+  raw: data                       # the three CSVs; kept after conversion, resolved via repo root
   artifacts: artifacts
   parquet: artifacts/parquet
   candidates: artifacts/candidates # top-K per customer per window; written once, digested

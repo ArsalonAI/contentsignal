@@ -15,7 +15,15 @@ from typing import Annotated, NoReturn
 import typer
 
 from contentsignal import __version__
-from contentsignal.config import load_data_config, load_split_config
+from contentsignal.config import (
+    load_data_config,
+    load_split_config,
+    outputs_are_current,
+    resolve_path,
+    write_stamp,
+)
+from contentsignal.data import to_parquet
+from contentsignal.data.schema import RAW_FILES
 from contentsignal.splits.temporal import candidate_windows, load_windows
 
 app = typer.Typer(
@@ -75,21 +83,77 @@ def check_kaggle_credentials(path: Path | None = None) -> Path:
     return creds
 
 
+def _report(report: to_parquet.IngestReport) -> None:
+    for table in report.tables:
+        typer.echo(f"  {table.name:<15} {table.rows:>12,} rows  {table.bytes / 1e6:>8.1f} MB")
+    typer.echo(f"  transaction range   {report.first_txn} .. {report.last_txn}")
+    typer.echo(f"  empty detail_desc   {report.empty_detail_desc:,} articles")
+
+
 @app.command()
 def ingest(
     force: Annotated[bool, typer.Option("--force", help="Rebuild even if outputs exist.")] = False,
+    force_customer_index: Annotated[
+        bool,
+        typer.Option(
+            "--force-customer-index",
+            help="Also re-derive customer_index.parquet. Invalidates every downstream artifact.",
+        ),
+    ] = False,
 ) -> None:
-    """Download the Kaggle CSVs and convert them to Parquet."""
-    try:
-        creds = check_kaggle_credentials()
-    except KaggleCredentialsError as exc:
-        typer.secho(f"ingest: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+    """Convert the raw CSVs to Parquet, downloading them from Kaggle only if absent.
 
+    The credential check runs only when a file is actually missing. Requiring a Kaggle
+    token to convert CSVs that are already on disk blocks the stage on a step that has
+    nothing left to do.
+    """
     cfg = load_data_config()
-    typer.echo(f"credentials ok: {creds}")
-    typer.echo(f"competition: {cfg.kaggle.competition}")
-    _todo("ingest", "M1", "CSV -> Parquet via DuckDB streaming, narrowed dtypes")
+    split_cfg = load_split_config()
+
+    raw_dir = resolve_path(cfg.paths.raw)
+    parquet_dir = resolve_path(cfg.paths.parquet)
+    stamp = parquet_dir / "_stamp"
+    digest = to_parquet.ingest_digest(cfg)
+
+    missing = [name for name in RAW_FILES if not (raw_dir / name).is_file()]
+    if missing:
+        typer.echo(f"raw files missing from {raw_dir}: {', '.join(missing)}")
+        try:
+            creds = check_kaggle_credentials()
+        except KaggleCredentialsError as exc:
+            typer.secho(f"ingest: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2) from exc
+        typer.echo(f"credentials ok: {creds}")
+
+        from contentsignal.data.download import download_competition  # noqa: PLC0415
+
+        download_competition(cfg.kaggle.competition, raw_dir, log=typer.echo)
+    else:
+        typer.echo(f"raw files present in {raw_dir}; skipping download")
+
+    if outputs_are_current(stamp, digest, force=force) and to_parquet.outputs_exist(parquet_dir):
+        typer.echo(
+            f"ingest: up to date at {parquet_dir} (config {digest[:12]}); --force to rebuild"
+        )
+        _report(to_parquet.existing_report(parquet_dir))
+        return
+
+    try:
+        report = to_parquet.convert(
+            raw_dir=raw_dir,
+            out_dir=parquet_dir,
+            temp_dir=resolve_path(cfg.paths.artifacts) / "tmp",
+            expected_range=(split_cfg.dataset_start, split_cfg.dataset_end),
+            force_customer_index=force_customer_index,
+            log=typer.echo,
+        )
+    except to_parquet.IngestValidationError as exc:
+        typer.secho(f"ingest: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    write_stamp(stamp, digest)
+    typer.echo(f"ingest: wrote {parquet_dir} (config {digest[:12]})")
+    _report(report)
 
 
 @app.command()

@@ -3,7 +3,8 @@
 /artifacts/
 mlruns/
 
-# Raw Kaggle download. Deleted after parquet conversion (prd.md §3), but never tracked.
+# Raw CSVs — 3.7 GB, whether downloaded from Kaggle or dropped in by hand. Kept after parquet
+# conversion (deleting a hand-supplied input is not the pipeline's call), and never tracked.
 #
 # Anchored with a leading slash on purpose. An unanchored `data/` matches at ANY depth, so
 # it also swallows `src/contentsignal/data/` — the ingest package (download.py, to_parquet.py,

@@ -264,7 +264,8 @@ be fabricated.
 
 ### Ingest
 
-CSV → Parquet once, with narrowed dtypes, then the raw CSVs are deleted:
+CSV → Parquet once, with narrowed dtypes. The raw CSVs are kept — 3.7 GB of disk, and 30–60 min
+of network to get back:
 
 | Column | Stored as |
 |---|---|
@@ -772,9 +773,9 @@ contentsignal/
 | **Content retrieval shows no cold-start lift** | Pre-committed to reporting it as the headline finding (§2). The `R1`/`R2`/`R2-A` decomposition makes a null *interpretable* rather than merely disappointing |
 | **DCN-v2 loses to LightGBM** | Expected, and pre-registered as such. GBDTs usually win on tabular-dominant problems at this scale; keeping the baseline is what makes the loss diagnostic instead of embarrassing |
 | **Popularity baseline wins outright** | Report it. It is a real and frequently observed outcome on implicit-feedback data, and concealing it would invalidate everything else |
-| **8 GB OOM** | DuckDB for aggregation, Polars over pandas, `float32` throughout, 47 ranker columns instead of 80, stage 1 on positives only, MLP/DCN stream minibatches from Parquet, `max_bin=63` for LightGBM, raw CSVs deleted post-conversion |
+| **8 GB OOM** | DuckDB for aggregation, Polars over pandas, `float32` throughout, 47 ranker columns instead of 80, stage 1 on positives only, MLP/DCN stream minibatches from Parquet, `max_bin=63` for LightGBM. Raw CSVs are **kept**, not deleted post-conversion — they cost disk, not RAM, and re-acquiring them costs 30–60 min |
 | **MPS instability / silent numerical issues** | Documented CPU fallback; parity check that MPS and CPU vectors agree within tolerance on a fixed sample |
-| **Kaggle download blocked** | Requires accepting the competition rules on Kaggle **and** placing `kaggle.json` at `~/.kaggle/` with mode 600 — currently absent on this machine. M0 is blocked until then |
+| **Kaggle download blocked** | **Retired.** The three CSVs are in `data/` and converted; `ingest` only calls the Kaggle API when a file is actually missing, so credentials are not on the critical path. The download route survives for a fresh clone and still needs accepted rules plus `kaggle.json` at mode 600 |
 
 ---
 

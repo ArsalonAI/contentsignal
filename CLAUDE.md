@@ -9,24 +9,35 @@ Two specification documents govern the work:
 - `prd.md` — what is being built and why (approved)
 - `trd.md` — how: schemas, signatures, algorithms, resource budgets, test assertions
 
-**Implemented so far (M0 environment half, plus the data-free part of the M1/M2 gate):**
+**Implemented so far (M0 complete, plus M1's ingest half):**
 
 - `pyproject.toml` / `uv.lock` — Python 3.11 env, deps per `trd.md` §2
-- `conf/split.yaml`, `conf/data.yaml`, `src/contentsignal/config.py` — typed config and
-  `config_sha256`, the digest behind every stage's idempotency check
-- `src/contentsignal/cli.py` — all `trd.md` §13 commands declared. Only `ingest`'s Kaggle
-  preflight and `splits` do real work; the rest raise `NotImplementedError` naming their
-  milestone
+- `conf/split.yaml`, `conf/data.yaml`, `src/contentsignal/config.py` — typed config,
+  `config_sha256` (the digest behind every stage's idempotency check), and `resolve_path`,
+  which anchors relative config paths at the repo root rather than the cwd
+- `src/contentsignal/cli.py` — all `trd.md` §13 commands declared. `ingest` and `splits` do
+  real work; the rest raise `NotImplementedError` naming their milestone
+- `src/contentsignal/data/` — `schema.py` (the §4.1–4.4 column contract, CSV read specs, and
+  the eleven categoricals), `to_parquet.py` (DuckDB streaming conversion, atomic writes,
+  post-write validation), `download.py` (the Kaggle fresh-clone fallback)
 - `splits/temporal.py`, `features/base.py`, `sampling/negatives.py`,
   `eval/calibration.py`, `models/base.py` — the invariant spine
-- `tests/` — `test_splits`, `test_sampling`, `test_calibration` green; `test_leakage`
-  green except the deletion-invariance property, which is parameterized over an
-  `ALL_BUILDERS` registry that stays empty until M2
+- `tests/` — `test_splits`, `test_sampling`, `test_calibration`, `test_ingest` green;
+  `test_leakage` green except the deletion-invariance property, which is parameterized over
+  an `ALL_BUILDERS` registry that stays empty until M2
 
-**Not implemented:** ingest body, EDA, feature builders, the two-tower retriever, item-vector
-precomputation, candidate generation, all three rankers, evaluation, benchmark, report. Assume a
-command does not run unless it appears above. Implementation follows the M0–M9 milestones in
-`trd.md` §16.
+**Data is on disk.** The three CSVs are in `data/` (gitignored) and
+`artifacts/parquet/{transactions,articles,customers,customer_index}.parquet` is built —
+31,788,324 transactions spanning 2018-09-20 → 2020-09-22, 105,542 articles (416 with an empty
+`detail_desc`), 1,371,980 customers. Ingest runs in ~10 s at 1.58 GB peak RSS.
+
+**Not implemented:** EDA, feature builders, the two-tower retriever, item-vector precomputation,
+candidate generation, all three rankers, evaluation, benchmark, report. Assume a command does not
+run unless it appears above. Implementation follows the M0–M9 milestones in `trd.md` §16.
+
+**Still open at M1:** `eval.cold_start_threshold` (10) and `eval.low_history_threshold` (3) in
+`conf/data.yaml` are placeholders. `trd.md` §10.5 requires both be set once from the measured
+distributions during EDA and then frozen; moving one after seeing results is p-hacking.
 
 Before writing code, read `trd.md` §5 (module contracts) and §6 (feature specification). They
 are precise enough that implementation is mechanical, and deviating from them silently breaks
@@ -76,8 +87,12 @@ contrastive objective, so the text encoder trains jointly with the towers inside
 Environment: **Python 3.11 via `uv`** — system Python is 3.9.6 and cannot be used.
 Tests: `pytest`, with a single test as `pytest tests/test_leakage.py::test_name`.
 
-**M0 is blocked** until the H&M competition rules are accepted on Kaggle and
-`~/.kaggle/kaggle.json` exists with mode `600`. Neither is true on this machine.
+`ingest` reads `data/` and only calls Kaggle when a CSV is actually missing, so no credentials
+are needed on this machine. It does not delete the raw CSVs after conversion — re-acquiring them
+costs 30–60 min of network, and deleting a hand-supplied input is not the pipeline's call.
+`--force` rebuilds everything except `customer_index.parquet`, which is written once because
+every downstream artifact keys on `customer_idx` (`trd.md` §4.4); `--force-customer-index` is
+the deliberate escape hatch.
 
 ## Architecture
 
